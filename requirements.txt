@@ -1,7 +1,7 @@
 # Core LlamaIndex framework (Python 3.13 compatible)
 llama-index==0.11.23
-llama-index-core==0.11.23
-llama-index-llms-ollama==0.3.6
+llama-index-core==0.14.20
+llama-index-llms-ollama==0.10.1
 llama-index-embeddings-huggingface==0.3.1
 llama-index-vector-stores-chroma==0.2.0
 
@@ -11,15 +11,15 @@ transformers>=4.40.0
 
 # Embedding models and vector database
 sentence-transformers>=3.2.0
-chromadb==0.4.24  # Stable version compatible with llama-index 0.11.23
+chromadb==0.4.24  # Stable version compatible with llama-index
 
 # Required dependencies (Python 3.13 compatible)
 pytest>=8.0.0
 pytest-cov>=4.1.0
 python-dotenv>=1.0.0
 tqdm>=4.66.1
-numpy>=1.24.0,<2.0.0  # Compatible with llama-index-core
-pandas>=2.0.0,<2.3.0  # Compatible range
+numpy>=1.24.0  # Compatible with llama-index-core
+pandas>=2.0.0  # Compatible range
 
 # Code quality (Python 3.13 compatible)
 flake8>=7.0.0
