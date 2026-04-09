@@ -39,13 +39,16 @@ class OllamaBackend:
         """
         try:
             start_time = time.time()
-            response = self.llm.complete(prompt, **kwargs)
+            # Use chat API instead of complete to avoid usage field issues
+            from llama_index.core.base.llms.types import ChatMessage, MessageRole
+            messages = [ChatMessage(role=MessageRole.USER, content=prompt)]
+            response = self.llm.chat(messages, **kwargs)
             end_time = time.time()
 
             latency = end_time - start_time
             logger.info(f"Ollama generation completed in {latency:.2f}s")
 
-            return response.text
+            return response.message.content
 
         except Exception as e:
             logger.error(f"Error generating response from Ollama: {e}")

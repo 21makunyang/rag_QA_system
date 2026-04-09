@@ -10,6 +10,7 @@ from chromadb.config import Settings
 from llama_index.core import Document, StorageContext, VectorStoreIndex
 from llama_index.core.schema import NodeWithScore, QueryBundle
 from llama_index.vector_stores.chroma import ChromaVectorStore
+
 from src import Config
 
 logger = logging.getLogger(__name__)
@@ -159,11 +160,9 @@ class Retriever:
             # Create retriever with specified similarity threshold
             retriever = self.index.as_retriever(similarity_top_k=top_k)
 
-            # Create query bundle with the query string
-            query_bundle = QueryBundle(query_str=query)
-
-            # Retrieve relevant document nodes
-            nodes_with_scores: List[NodeWithScore] = retriever._retrieve(query_bundle)
+            # LlamaIndex 0.11.x requires using the public retrieve method
+            # instead of the internal _retrieve method
+            nodes_with_scores = retriever.retrieve(query)
 
             # Format results for response generation
             retrieved_docs = []
@@ -172,12 +171,12 @@ class Retriever:
                     'text': node_with_score.node.text,
                     'score': node_with_score.score,
                     'metadata': node_with_score.node.metadata,
-                    'doc_id': node_with_score.node.id_
+                    'doc_id': node_with_score.node.id_ if hasattr(node_with_score.node, 'id_') else node_with_score.node.node_id
                 }
                 retrieved_docs.append(doc_info)
 
             logger.info(f"Retrieved {len(retrieved_docs)} documents")
-            return retrieved_docs
+            return retrieved_docs[:top_k]  # Ensure we return only top_k results
 
         except Exception as e:
             logger.error(f"Error retrieving documents: {e}")
@@ -198,23 +197,28 @@ class Retriever:
             List of matching documents with similarity scores
         """
         try:
-            # Use LlamaIndex's native vector search capabilities
-            query_bundle = QueryBundle(embeddings=query_vector)
+            # Use ChromaDB's native vector search capabilities
+            if not self.collection:
+                return []
 
-            # Perform similarity search
-            retriever = self.index.as_retriever(similarity_top_k=top_k)
-            nodes_with_scores = retriever._retrieve(query_bundle)
+            # Perform direct vector search using ChromaDB
+            results = self.collection.query(
+                query_embeddings=[query_vector],
+                n_results=top_k,
+                include=['documents', 'metadatas', 'distances']
+            )
 
-            # Format results
+            # Format results for consistency with LlamaIndex interface
             retrieved_docs = []
-            for node_with_score in nodes_with_scores:
-                doc_info = {
-                    'text': node_with_score.node.text,
-                    'score': node_with_score.score,
-                    'metadata': node_with_score.node.metadata,
-                    'doc_id': node_with_score.node.id_
-                }
-                retrieved_docs.append(doc_info)
+            if results['documents'] and results['documents'][0]:
+                for i in range(len(results['documents'][0])):
+                    doc_info = {
+                        'text': results['documents'][0][i],
+                        'score': 1.0 - (results['distances'][0][i] if results['distances'] and results['distances'][0] else 0.0),
+                        'metadata': results['metadatas'][0][i] if results['metadatas'] and results['metadatas'][0] else {},
+                        'doc_id': f"doc_{i}"
+                    }
+                    retrieved_docs.append(doc_info)
 
             return retrieved_docs
 
