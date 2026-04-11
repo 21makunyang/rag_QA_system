@@ -7,6 +7,8 @@ import logging
 import sys
 from pathlib import Path
 
+from sympy import false
+
 from src import Config
 from src.ingestion.connectors import PDFConnector, TextFileConnector
 from src.ingestion.chunking import ChunkingFactory
@@ -23,9 +25,11 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+
 def setup_directories():
     """Create necessary directories"""
     Config.create_directories()
+
 
 def initialize_components(model_name: str = "mistral-7b"):
     """
@@ -80,6 +84,7 @@ def initialize_components(model_name: str = "mistral-7b"):
         "metrics_calc": metrics_calc
     }
 
+
 def process_documents(components: dict, document_dir: str):
     """
     Process documents in the specified directory
@@ -116,6 +121,7 @@ def process_documents(components: dict, document_dir: str):
             except Exception as e:
                 logger.error(f"Error processing {text_file.name}: {e}")
 
+
 def query_pipeline(components: dict, query: str) -> dict:
     """
     Execute query pipeline
@@ -146,6 +152,7 @@ def query_pipeline(components: dict, query: str) -> dict:
         "metrics": metrics
     }
 
+
 def main():
     """Main function"""
     parser = argparse.ArgumentParser(description="CS6493 LLM Applications")
@@ -172,7 +179,11 @@ def main():
         action="store_true",
         help="Only process documents without querying"
     )
-
+    parser.add_argument(
+        "--rechunking",
+        action="store_true",
+        help="Rechunk the documents if this flag is set"
+    )
     args = parser.parse_args()
 
     # Setup
@@ -182,10 +193,13 @@ def main():
     components = initialize_components(args.model)
 
     # Process documents
-    if Path(args.documents).exists():
-        process_documents(components, args.documents)
+    if args.rechunking:
+        if Path(args.documents).exists():
+            process_documents(components, args.documents)
+        else:
+            logger.warning(f"Documents directory does not exist: {args.documents}")
     else:
-        logger.warning(f"Documents directory does not exist: {args.documents}")
+        logger.info("Rechunking is disabled.")
 
     # Query or interactive mode
     if args.process_only:
@@ -215,6 +229,7 @@ def main():
                 break
             except Exception as e:
                 logger.error(f"Error processing query: {e}")
+
 
 if __name__ == "__main__":
     main()
