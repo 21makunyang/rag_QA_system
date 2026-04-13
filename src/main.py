@@ -7,7 +7,6 @@ import logging
 import sys
 from pathlib import Path
 
-from sympy import false
 
 from src import Config
 from src.ingestion.connectors import PDFConnector, TextFileConnector
@@ -184,10 +183,21 @@ def main():
         action="store_true",
         help="Rechunk the documents if this flag is set"
     )
+    parser.add_argument(
+        "--gui",
+        action="store_true",
+        help="Launch GUI interface instead of CLI"
+    )
     args = parser.parse_args()
 
     # Setup
     setup_directories()
+
+    # GUI mode
+    if args.gui:
+        logger.info("Launching GUI interface...")
+        launch_gui()
+        return
 
     # Initialize components
     components = initialize_components(args.model)
@@ -229,6 +239,21 @@ def main():
                 break
             except Exception as e:
                 logger.error(f"Error processing query: {e}")
+
+
+def launch_gui():
+    """Launch GUI interface"""
+    try:
+        from src.gui.gradio_interface import create_rag_interface
+        interface = create_rag_interface()
+        interface.launch(
+            server_name="0.0.0.0",
+            server_port=7860,
+            share=False
+        )
+    except Exception as e:
+        logger.error(f"Error launching GUI: {e}")
+        raise
 
 
 if __name__ == "__main__":

@@ -1,5 +1,5 @@
 # Core LlamaIndex framework (Python 3.13 compatible)
-llama-index==0.11.23
+llama-index==0.14.20
 llama-index-core==0.14.20
 llama-index-llms-ollama==0.10.1
 llama-index-embeddings-huggingface==0.3.1
@@ -27,3 +27,7 @@ black>=24.1.0
 
 # Document processing
 pdfminer.six>=20221105
+
+# GUI framework
+gradio>=4.0.0
+psutil>=5.9.0

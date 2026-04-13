@@ -121,3 +121,24 @@ class OllamaBackend:
             "max_tokens": self.config.max_tokens,
             "api_base": self.config.api_base
         }
+
+    def update_temperature(self, temperature: float):
+        """
+        Update temperature parameter for the LLM
+
+        Args:
+            temperature: New temperature value (0.0 to 1.0)
+        """
+        if self.config.temperature == temperature:
+            return
+
+        self.config.temperature = temperature
+        # Reinitialize the LLM with new temperature
+        self.llm = Ollama(
+            model=self.config.model_name,
+            base_url=self.config.api_base,
+            temperature=temperature,
+            max_tokens=self.config.max_tokens,
+            request_timeout=30.0
+        )
+        logger.info(f"Updated Ollama temperature to: {temperature}")
