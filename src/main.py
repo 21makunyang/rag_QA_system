@@ -3,10 +3,9 @@ Main entry point for CS6493 LLM Applications
 """
 
 import argparse
+import json
 import logging
-import sys
 from pathlib import Path
-
 
 from src import Config
 from src.ingestion.connectors import PDFConnector, TextFileConnector
@@ -152,6 +151,66 @@ def query_pipeline(components: dict, query: str) -> dict:
     }
 
 
+def eval_pipeline(components: dict, eval_set_file: str) -> dict:
+    """
+    Execute eval pipeline
+
+    Args:
+        components: Dictionary of initialized components
+        eval_set_file:
+            Path to evaluation dataset (JSON format).
+            Expected format:
+                [
+                    {
+                        "query": str,
+                        "ground_truth_context": List[str]
+                    },
+                    ...
+                ]
+            example:
+                [
+                    {
+                        "query": "What is LlamaIndex?",
+                        "ground_truth_context": [
+                            "LlamaIndex is a cutting-edge data framework for ..."
+                        ],
+                        "answer": "LlamaIndex is a cutting-edge data framework for ..."
+                    }
+                ]
+
+    Returns:
+        Response dictionary with metrics
+    """
+    from src.evaluation.recall_evaluation import RecallEvaluator
+    logger.info("Running in evaluation mode")
+
+    recall_evaluator = RecallEvaluator(similarity_threshold=0.7, top_k=5)
+
+    with open(eval_set_file, 'r') as eval_raw:
+        eval_set = json.load(eval_raw)
+
+    all_recall_metrics = list()
+    for item in eval_set:
+        query = item["query"]
+        ground_truth_context = item["ground_truth_context"]
+
+        # Generate response
+        response = components["response_gen"].generate_response(query)
+        retrieved_contexts = [item["text"] for item in response["retrieved_docs"]]
+        print(f"retrieved contexts: {retrieved_contexts}")
+
+        # Calculate metrics
+        recall_metrics = recall_evaluator.calculate_exact_recall(
+            retrieved_contexts=retrieved_contexts,
+            ground_truth_contexts=ground_truth_context
+        )
+        all_recall_metrics.append(recall_metrics)
+
+    return {
+        "avg_recall_metrics": sum(all_recall_metrics) / len(all_recall_metrics)
+    }
+
+
 def main():
     """Main function"""
     parser = argparse.ArgumentParser(description="CS6493 LLM Applications")
@@ -188,6 +247,17 @@ def main():
         action="store_true",
         help="Launch GUI interface instead of CLI"
     )
+    parser.add_argument(
+        "--evaluate",
+        action="store_true",
+        help="Run evaluation mode to assess RAG system performance"
+    )
+    parser.add_argument(
+        "--eval_set_file",
+        type=str,
+        default="./data/eval/eval_set.json",
+        help="evaluation dataset file name."
+    )
     args = parser.parse_args()
 
     # Setup
@@ -210,6 +280,12 @@ def main():
             logger.warning(f"Documents directory does not exist: {args.documents}")
     else:
         logger.info("Rechunking is disabled.")
+
+    # Evaluation mode
+    if args.evaluate:
+        result = eval_pipeline(components, eval_set_file=args.eval_set_file)
+        print(f"Evaluate result: {result}")
+        return
 
     # Query or interactive mode
     if args.process_only:

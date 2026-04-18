@@ -30,8 +30,10 @@ class ChunkingConfig:
 class VectorStoreConfig:
     """Configuration for vector storage"""
     store_type: str = "chroma"  # chroma, faiss
-    persist_dir: str = "./data/vector_store"
-    collection_name: str = "cs6493_collection"
+    # persist_dir: str = "./data/vector_store"
+    persist_dir: str = "./data/eval/vector_store"
+    # collection_name: str = "cs6493_collection"
+    collection_name: str = "cs6493_eval_collection"
 
 class Config:
     """Main configuration class"""
@@ -83,6 +85,13 @@ class Config:
     VECTOR_STORE_DIR = "./data/vector_store"
     RESULTS_DIR = "./data/results"
 
+    EVAL_DIR = "./data/eval"
+
+    # evaluate dir
+    DOCUMENTS_DIR = "./data/eval/documents"
+    VECTOR_STORE_DIR = "./data/eval/vector_store"
+    RESULTS_DIR = "./data/eval/results"
+
     @classmethod
     def get_model_config(cls, model_name: str) -> ModelConfig:
         """Get configuration for a specific model"""
@@ -96,3 +105,4 @@ class Config:
         os.makedirs(cls.DOCUMENTS_DIR, exist_ok=True)
         os.makedirs(cls.VECTOR_STORE_DIR, exist_ok=True)
         os.makedirs(cls.RESULTS_DIR, exist_ok=True)
+        os.makedirs(cls.EVAL_DIR, exist_ok=True)
