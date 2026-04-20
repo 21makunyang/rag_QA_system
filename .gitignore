@@ -97,3 +97,6 @@ logs/
 htmlcov/
 .tox/
 .pytest_cache/
+
+分工.md
+Progress_Report.md
