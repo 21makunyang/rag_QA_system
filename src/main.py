@@ -43,7 +43,7 @@ def initialize_components(model_name: str = "mistral-7b"):
 
     # Get model configuration
     model_config = Config.get_model_config(model_name)
-
+    print(f"model config: {model_config}")
     # Initialize LLM backend
     if model_config.backend == "ollama":
         llm_backend = OllamaBackend(model_config)
@@ -275,6 +275,10 @@ def main():
     # Process documents
     if args.rechunking:
         if Path(args.documents).exists():
+            # Clear existing index before rechunking
+            logger.info("Clearing existing vector index...")
+            components["retriever"].clear_index()
+
             process_documents(components, args.documents)
         else:
             logger.warning(f"Documents directory does not exist: {args.documents}")

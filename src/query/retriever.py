@@ -250,8 +250,13 @@ class Retriever:
         """
         try:
             if self.collection:
-                self.collection.delete()
-                logger.info("Cleared all documents from index")
+                # Get all document IDs and delete them
+                collection_data = self.collection.get()
+                if collection_data['ids']:
+                    self.collection.delete(ids=collection_data['ids'])
+                    logger.info(f"Cleared {len(collection_data['ids'])} documents from index")
+                else:
+                    logger.info("Index is already empty")
         except Exception as e:
             logger.error(f"Error clearing index: {e}")
             raise
