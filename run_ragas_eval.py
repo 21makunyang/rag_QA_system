@@ -10,29 +10,34 @@ Quick start
 That's it.  The script will:
   • Load all PDFs from the folder
   • Auto-generate test questions with Ragas (generator_llm + critic_llm)
-  • Index the documents and answer every question with the RAG pipeline
+  • Chunk documents with the same strategy as the main RAG system
+  • Index the chunks and answer every question with the RAG pipeline
   • Score the answers with 4 Ragas metrics
   • Print results and save them to  ragas_results.csv
 
 Options
 -------
-    --docs-dir      PATH    Folder with PDF/text files (default: ./data/eval/ragas_docs/)
-    --testset-size  N       Number of questions to generate (default: 8)
-    --top-k         K       Documents retrieved per question (default: 3)
-    --output        PATH    CSV output path (default: ./ragas_results.csv)
-    --rag-model     MODEL   openrouter | mistral-7b | llama2-7b | t5-base  (default: openrouter)
-    --skip-indexing         Reuse vector store from a previous run (faster re-runs)
-    --vector-store-dir DIR  Isolated ChromaDB directory (default: ./data/eval/ragas_eval_store)
+    --docs-dir           PATH    Folder with PDF/text files (default: ./data/eval/ragas_docs/)
+    --testset-size       N       Number of questions to generate (default: 8)
+    --top-k              K       Documents retrieved per question (default: 3)
+    --output             PATH    CSV output path (default: ./ragas_results.csv)
+    --rag-model          MODEL   mistral-7b | llama2-7b | t5-base  (default: mistral-7b)
+    --chunking-strategy  STR     fixed | sentence  (default: inherits Config.CHUNKING.strategy)
+    --skip-indexing              Reuse vector store from a previous run (faster re-runs)
+    --vector-store-dir   DIR     Isolated ChromaDB directory (default: ./data/eval/ragas_eval_store)
 
 Supported document formats
 ---------------------------
     .pdf   .txt   .md
 
-Model configuration (hard-coded)
+Model configuration (hard-coded, local Ollama)
 ---------------------------------
-    generator_llm / critic_llm / Ragas judge:
-        NVIDIA Nemotron-3 Super 120B  (nvidia/nemotron-3-super-120b-a12b:free)
-        via OpenRouter  (https://openrouter.ai/api/v1)
+    generator_llm:
+        mistral:7b  (via Ollama)
+    critic/transforms_llm:
+        llama2:7b   (via Ollama)
+    Ragas judge:
+        mistral:7b  (via Ollama)
     Embedding:
         sentence-transformers/all-MiniLM-L6-v2  (local HuggingFace)
 """
@@ -93,12 +98,25 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--rag-model",
         type=str,
-        default="openrouter",
-        choices=["openrouter", "mistral-7b", "llama2-7b", "t5-base"],
+        default="mistral-7b",
+        choices=["mistral-7b", "llama2-7b", "t5-base"],
         metavar="MODEL",
         help=(
             "LLM backend for RAG answer generation. "
-            "Choices: openrouter (default), mistral-7b, llama2-7b, t5-base."
+            "Choices: mistral-7b (default), llama2-7b, t5-base."
+        ),
+    )
+    parser.add_argument(
+        "--chunking-strategy",
+        type=str,
+        default=None,
+        choices=["fixed", "sentence"],
+        metavar="STR",
+        help=(
+            "Chunking strategy used when indexing documents into the evaluation "
+            "vector store.  Must match what the main RAG system uses so that the "
+            "evaluation reflects real retrieval behaviour. "
+            "Choices: fixed, sentence.  Default: inherit from Config.CHUNKING.strategy."
         ),
     )
     parser.add_argument(
@@ -133,25 +151,45 @@ def main() -> None:
     _configure_logging()
     args = _parse_args()
 
-    from src.evaluation.ragas_eval import RagasEvaluator, _OPENROUTER_MODEL  # noqa: PLC0415
+    from src.evaluation.ragas_eval import (  # noqa: PLC0415
+        RagasEvaluator,
+        _OLLAMA_BASE_URL,
+        _OLLAMA_CRITIC_MODEL,
+        _OLLAMA_GENERATOR_MODEL,
+        _OLLAMA_JUDGE_MODEL,
+        _RAGAS_DOCS_PER_QUESTION,
+        _RAGAS_MAX_TESTSET_DOCS,
+        _RAGAS_MAX_WORKERS,
+        _RAGAS_PARSE_MIN_DOCS,
+    )
     from src.config import Config  # noqa: PLC0415
 
     docs_path = Path(args.docs_dir)
 
     print()
     print("=" * 72)
-    print("  CS6493 RAG System – Ragas Evaluation")
+    print("  CS6493 RAG System – Ragas Evaluation  (local Ollama)")
     print("=" * 72)
+    effective_chunking = args.chunking_strategy or Config.CHUNKING.strategy
     print(f"  Document folder  : {docs_path.resolve()}")
     print(f"  Testset size     : {args.testset_size} questions (auto-generated)")
-    print(f"  generator_llm    : {_OPENROUTER_MODEL}  (T=0.4)")
-    print(f"  critic_llm       : {_OPENROUTER_MODEL}  (T=0.0)")
+    print(f"  generator LLM    : {_OLLAMA_GENERATOR_MODEL}  (T=0.4, via Ollama)")
+    print(f"  critic LLM       : {_OLLAMA_CRITIC_MODEL}  (T=0.0, via Ollama)")
+    print(f"  Ragas judge LLM  : {_OLLAMA_JUDGE_MODEL}  (T=0.0, via Ollama)")
     print(f"  RAG answer model : {args.rag_model}")
     print(f"  Embedding model  : {Config.EMBEDDING_MODEL}")
+    print(f"  Chunking strategy: {effective_chunking} "
+          f"(chunk_size={Config.CHUNKING.chunk_size}, overlap={Config.CHUNKING.chunk_overlap})")
+    print(f"  Ollama server    : {_OLLAMA_BASE_URL}")
     print(f"  Retrieve top-k   : {args.top_k}")
     print(f"  Vector store     : {args.vector_store_dir}")
     print(f"  Output CSV       : {args.output}")
     print(f"  Skip indexing    : {args.skip_indexing}")
+    print("  Stability config : "
+          f"RAGAS_MAX_WORKERS={_RAGAS_MAX_WORKERS}, "
+          f"RAGAS_DOCS_PER_QUESTION={_RAGAS_DOCS_PER_QUESTION}, "
+          f"RAGAS_MAX_TESTSET_DOCS={_RAGAS_MAX_TESTSET_DOCS}, "
+          f"RAGAS_PARSE_MIN_DOCS={_RAGAS_PARSE_MIN_DOCS}")
     print("=" * 72)
 
     # Check docs folder exists and warn if empty before starting
@@ -170,6 +208,7 @@ def main() -> None:
         vector_store_dir=args.vector_store_dir,
         top_k=args.top_k,
         testset_size=args.testset_size,
+        chunking_strategy=args.chunking_strategy,
     )
     evaluator.run(skip_indexing=args.skip_indexing)
 

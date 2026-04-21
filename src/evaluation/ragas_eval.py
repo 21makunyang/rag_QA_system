@@ -8,28 +8,39 @@ Pipeline
    PDFs are split into per-page chunks so Ragas can generate
    diverse questions across the whole document.
 2. Ragas TestsetGenerator automatically builds a labelled test dataset.
-   - llm (generator, T=0.4) : generates questions from the corpus.
-   - transforms_llm (critic, T=0.0) : filters / refines the questions.
-3. Documents are indexed into an isolated ChromaDB collection.
+   - generator LLM  (mistral:7b, T=0.4) : generates diverse questions.
+   - transforms LLM (llama2:7b, T=0.0)  : critic role, filters / refines questions.
+3. Documents are chunked using the **same strategy as the main RAG system**
+   (FixedSizeChunking or SentenceBasedChunking via ChunkingFactory) and
+   then indexed into an isolated ChromaDB collection.
 4. Each generated question is answered by the RAG pipeline
    (Retriever → ResponseGenerator).
 5. Ragas evaluates all samples with four metrics:
    Faithfulness · Answer Relevancy · Context Precision · Context Recall
 6. Results are printed to the console and exported to CSV.
 
-LLM config (hard-coded)
------------------------
-  generator LLM / critic (transforms) LLM / RAG LLM / judge:
-      NVIDIA Nemotron-3 Super 120B  (nvidia/nemotron-3-super-120b-a12b:free)
-      via OpenRouter  (https://openrouter.ai/api/v1)
-  Embedding:
-      sentence-transformers/all-MiniLM-L6-v2  (local HuggingFace)
+LLM config
+----------
+  generator LLM  : mistral:7b   via local Ollama  (T=0.4)
+  critic LLM     : llama2:7b    via local Ollama  (T=0.0)
+  RAG answer LLM : mistral:7b   via local Ollama
+  Ragas judge LLM: mistral:7b   via local Ollama  (T=0.0)
+  Embedding      : sentence-transformers/all-MiniLM-L6-v2  (local HuggingFace)
+
+Chunking
+--------
+  The RAG indexing step applies the same ChunkingFactory strategy that the
+  main application uses (default: FixedSizeChunking, chunk_size=256,
+  overlap=25).  Pass ``chunking_strategy="sentence"`` to switch to
+  SentenceBasedChunking, or ``None`` to inherit from Config.CHUNKING.
 """
 
 from __future__ import annotations
 
 import logging
 import os
+import re
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
@@ -41,25 +52,29 @@ load_dotenv()
 logger = logging.getLogger(__name__)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# OpenRouter credentials (API key embedded directly as requested)
+# Local Ollama model configuration
 # ─────────────────────────────────────────────────────────────────────────────
 
-# 下面两个模型任选其一
-# NVIDIA: Nemotron 3 Super (free)
-_OPENROUTER_API_KEY = (
-    "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"
-)
-_OPENROUTER_MODEL = "nvidia/nemotron-3-super-120b-a12b:free"
+# Ollama server URL (override via OLLAMA_API_BASE env var if needed)
+_OLLAMA_BASE_URL = os.environ.get("OLLAMA_API_BASE", "http://localhost:11434")
 
-# # Google: Gemma 4 31B (free)
-# _OPENROUTER_API_KEY = (
-#     "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"
-# )
-# _OPENROUTER_MODEL = "google/gemma-4-31b-it:free"
+# Generator LLM: produces diverse candidate questions (higher temperature)
+_OLLAMA_GENERATOR_MODEL = "mistral:7b"
 
-_OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
-# Model backend configuration for evaluation.
+# Critic / transforms LLM: filters & refines questions (zero temperature)
+_OLLAMA_CRITIC_MODEL = "llama2:7b"
 
+# Judge LLM used by Ragas metrics (zero temperature for consistent scoring)
+_OLLAMA_JUDGE_MODEL = "mistral:7b"
+
+# Ragas execution controls (tuned for local Ollama stability)
+_RAGAS_TIMEOUT = int(os.environ.get("RAGAS_TIMEOUT", "240"))
+_RAGAS_MAX_RETRIES = int(os.environ.get("RAGAS_MAX_RETRIES", "6"))
+_RAGAS_MAX_WAIT = int(os.environ.get("RAGAS_MAX_WAIT", "120"))
+_RAGAS_MAX_WORKERS = int(os.environ.get("RAGAS_MAX_WORKERS", "1"))
+_RAGAS_DOCS_PER_QUESTION = int(os.environ.get("RAGAS_DOCS_PER_QUESTION", "8"))
+_RAGAS_MAX_TESTSET_DOCS = int(os.environ.get("RAGAS_MAX_TESTSET_DOCS", "24"))
+_RAGAS_PARSE_MIN_DOCS = int(os.environ.get("RAGAS_PARSE_MIN_DOCS", "1"))
 
 # Default folder where the user drops evaluation PDF / text files
 _DEFAULT_DOCS_DIR = "./data/eval/ragas_docs"
@@ -229,78 +244,204 @@ def _to_langchain_docs(llamaindex_docs: list) -> list:
     return result
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# OpenRouter LLM backend (compatible with OllamaBackend / HuggingFaceBackend)
-# ─────────────────────────────────────────────────────────────────────────────
-
-
-class OpenRouterLLMBackend:
+def _estimate_token_count(text: str) -> int:
     """
-    Wraps the OpenRouter API and implements the same interface as
-    OllamaBackend so it can be passed to the existing ResponseGenerator.
+    Rough token estimate for mixed EN/CN text.
+
+    - For normal space-separated text, use word count.
+    - For dense no-space text (common in extracted slides/PDF blocks),
+      fallback to character-based estimation.
     """
+    stripped = (text or "").strip()
+    if not stripped:
+        return 0
 
-    def __init__(
-        self,
-        model_name: str = _OPENROUTER_MODEL,
-        api_key: str = _OPENROUTER_API_KEY,
-        base_url: str = _OPENROUTER_BASE_URL,
-        temperature: float = 0.7,
-        max_tokens: int = 512,
-    ) -> None:
-        self.model_name = model_name
-        self.api_key = api_key
-        self.base_url = base_url
-        self.temperature = temperature
-        self.max_tokens = max_tokens
-        self._client = self._init_client()
+    words = re.findall(r"\S+", stripped)
+    if len(words) <= 1:
+        # Character-based fallback (very rough but robust)
+        return max(1, len(stripped) // 4)
+    return len(words)
 
-    def _init_client(self):
-        try:
-            from openai import OpenAI  # noqa: PLC0415
-        except ImportError as exc:
-            raise ImportError("Run: pip install openai") from exc
-        return OpenAI(api_key=self.api_key, base_url=self.base_url)
 
-    def generate(self, prompt: str) -> str:
-        resp = self._client.chat.completions.create(
-            model=self.model_name,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=self.temperature,
-            max_tokens=self.max_tokens,
+def _prepare_langchain_docs_for_testset(
+    langchain_docs: list,
+    min_tokens: int = 120,
+    target_tokens: int = 260,
+) -> list:
+    """
+    Merge very short LangChain docs before feeding them into Ragas.
+
+    Why this is needed:
+    Ragas default transforms may reject inputs when document chunks are too short
+    (around <=100 tokens). PDF page-level extraction can produce many such chunks
+    (e.g., title pages, figure-only pages, slide bullets), even if total pages are large.
+    """
+    if not langchain_docs:
+        return []
+
+    try:
+        from langchain_core.documents import Document as LCDocument  # noqa: PLC0415
+    except ImportError:
+        from langchain.schema import Document as LCDocument  # type: ignore[no-redef]  # noqa: PLC0415
+
+    original_token_counts = [
+        _estimate_token_count(getattr(doc, "page_content", "") or "")
+        for doc in langchain_docs
+    ]
+    if original_token_counts:
+        logger.info(
+            "Ragas input docs before merge: n=%d, avg_tokens=%.1f, min=%d, max=%d",
+            len(original_token_counts),
+            sum(original_token_counts) / len(original_token_counts),
+            min(original_token_counts),
+            max(original_token_counts),
         )
-        return resp.choices[0].message.content or ""
 
-    def generate_stream(self, prompt: str):
-        stream = self._client.chat.completions.create(
-            model=self.model_name,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=self.temperature,
-            max_tokens=self.max_tokens,
-            stream=True,
+    grouped: Dict[str, list] = {}
+    group_order: List[str] = []
+    for doc in langchain_docs:
+        metadata = dict(getattr(doc, "metadata", {}) or {})
+        source = str(metadata.get("source") or metadata.get("file_name") or "unknown")
+        if source not in grouped:
+            grouped[source] = []
+            group_order.append(source)
+        grouped[source].append(doc)
+
+    merged_docs: list = []
+    for source in group_order:
+        docs = grouped[source]
+        docs = sorted(docs, key=lambda d: int((getattr(d, "metadata", {}) or {}).get("page", 10**9)))
+
+        buffer_texts: List[str] = []
+        buffer_tokens = 0
+        buffer_start_page = None
+        buffer_end_page = None
+
+        def flush_buffer() -> None:
+            nonlocal buffer_texts, buffer_tokens, buffer_start_page, buffer_end_page
+            if not buffer_texts:
+                return
+            joined = "\n\n".join(buffer_texts).strip()
+            if not joined:
+                buffer_texts, buffer_tokens = [], 0
+                buffer_start_page, buffer_end_page = None, None
+                return
+            meta = {"source": source, "merged_for_ragas": True, "merged_parts": len(buffer_texts)}
+            if buffer_start_page is not None:
+                meta["page_start"] = buffer_start_page
+                meta["page_end"] = buffer_end_page
+            merged_docs.append(LCDocument(page_content=joined, metadata=meta))
+            buffer_texts, buffer_tokens = [], 0
+            buffer_start_page, buffer_end_page = None, None
+
+        for doc in docs:
+            text = (getattr(doc, "page_content", "") or "").strip()
+            if not text:
+                continue
+
+            metadata = dict(getattr(doc, "metadata", {}) or {})
+            page = metadata.get("page")
+            tokens = _estimate_token_count(text)
+
+            # Keep sufficiently long docs as-is for diversity
+            if tokens >= min_tokens:
+                flush_buffer()
+                merged_docs.append(
+                    LCDocument(page_content=text, metadata=metadata)
+                )
+                continue
+
+            # Merge short docs together
+            if buffer_start_page is None and page is not None:
+                buffer_start_page = page
+            if page is not None:
+                buffer_end_page = page
+            buffer_texts.append(text)
+            buffer_tokens += tokens
+            if buffer_tokens >= target_tokens:
+                flush_buffer()
+
+        flush_buffer()
+
+    merged_token_counts = [
+        _estimate_token_count(getattr(doc, "page_content", "") or "")
+        for doc in merged_docs
+    ]
+    if merged_token_counts:
+        logger.info(
+            "Ragas input docs after merge:  n=%d, avg_tokens=%.1f, min=%d, max=%d",
+            len(merged_token_counts),
+            sum(merged_token_counts) / len(merged_token_counts),
+            min(merged_token_counts),
+            max(merged_token_counts),
         )
-        for chunk in stream:
-            delta = chunk.choices[0].delta.content
-            if delta:
-                yield delta
+    return merged_docs if merged_docs else langchain_docs
 
-    def get_model_info(self) -> Dict[str, Any]:
-        return {"model_name": self.model_name, "backend": "openrouter", "base_url": self.base_url}
+
+def _limit_docs_for_testset(langchain_docs: list, testset_size: int) -> list:
+    """
+    Cap the number of docs sent to Ragas transforms to improve local stability.
+
+    Ragas TestsetGenerator applies multiple LLM transforms to every input doc.
+    On local Ollama, sending too many docs at once can cause repeated 502 errors.
+    This function keeps representative docs across sources using round-robin.
+    """
+    if not langchain_docs:
+        return []
+
+    target_max = max(testset_size * _RAGAS_DOCS_PER_QUESTION, testset_size)
+    target_max = min(target_max, _RAGAS_MAX_TESTSET_DOCS)
+    if len(langchain_docs) <= target_max:
+        return langchain_docs
+
+    grouped: Dict[str, list] = {}
+    source_order: List[str] = []
+    for doc in langchain_docs:
+        metadata = dict(getattr(doc, "metadata", {}) or {})
+        source = str(metadata.get("source") or metadata.get("file_name") or "unknown")
+        if source not in grouped:
+            grouped[source] = []
+            source_order.append(source)
+        grouped[source].append(doc)
+
+    selected: list = []
+    group_indices = {source: 0 for source in source_order}
+    while len(selected) < target_max:
+        progressed = False
+        for source in source_order:
+            idx = group_indices[source]
+            if idx < len(grouped[source]) and len(selected) < target_max:
+                selected.append(grouped[source][idx])
+                group_indices[source] += 1
+                progressed = True
+        if not progressed:
+            break
+
+    logger.info(
+        "Downsampled docs for testset generation: %d -> %d (target_max=%d)",
+        len(langchain_docs),
+        len(selected),
+        target_max,
+    )
+    return selected if selected else langchain_docs
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Shared LangChain / Ragas model builders
+# Shared LangChain / Ragas model builders  (local Ollama)
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def _langchain_llm(temperature: float):
-    from langchain_openai import ChatOpenAI  # noqa: PLC0415
+def _langchain_llm(temperature: float, model_name: str = _OLLAMA_GENERATOR_MODEL):
+    """Return a ChatOllama instance pointing at a local Ollama model."""
+    try:
+        from langchain_ollama import ChatOllama  # noqa: PLC0415
+    except ImportError:
+        from langchain_community.chat_models import ChatOllama  # type: ignore[no-redef]  # noqa: PLC0415
 
-    return ChatOpenAI(
-        model=_OPENROUTER_MODEL,
-        api_key=_OPENROUTER_API_KEY,
-        base_url=_OPENROUTER_BASE_URL,
+    return ChatOllama(
+        model=model_name,
         temperature=temperature,
+        base_url=_OLLAMA_BASE_URL,
     )
 
 
@@ -311,11 +452,11 @@ def _langchain_embeddings():
     return HuggingFaceEmbeddings(model_name=Config.EMBEDDING_MODEL)
 
 
-def _ragas_llm(temperature: float):
-    """Return a Ragas-wrapped ChatOpenAI instance."""
+def _ragas_llm(temperature: float, model_name: str = _OLLAMA_GENERATOR_MODEL):
+    """Return a Ragas-wrapped ChatOllama instance."""
     from ragas.llms import LangchainLLMWrapper  # noqa: PLC0415
 
-    return LangchainLLMWrapper(_langchain_llm(temperature))
+    return LangchainLLMWrapper(_langchain_llm(temperature, model_name))
 
 
 def _ragas_embeddings():
@@ -323,6 +464,169 @@ def _ragas_embeddings():
     from ragas.embeddings import LangchainEmbeddingsWrapper  # noqa: PLC0415
 
     return LangchainEmbeddingsWrapper(_langchain_embeddings())
+
+
+def _ragas_run_config(max_workers: int | None = None):
+    """Build a conservative RunConfig for local Ollama."""
+    from ragas.run_config import RunConfig  # noqa: PLC0415
+
+    workers = max_workers if max_workers is not None else _RAGAS_MAX_WORKERS
+    workers = max(1, int(workers))
+    return RunConfig(
+        timeout=_RAGAS_TIMEOUT,
+        max_retries=_RAGAS_MAX_RETRIES,
+        max_wait=_RAGAS_MAX_WAIT,
+        max_workers=workers,
+    )
+
+
+def _is_ollama_502_error(exc: Exception) -> bool:
+    """Detect transient Ollama gateway failures from exception text."""
+    message = str(exc).lower()
+    return "status code: 502" in message or "502 bad gateway" in message
+
+
+def _is_ragas_parse_error(exc: Exception) -> bool:
+    """Detect output parsing failures raised by Ragas/LangChain parsers."""
+    text = str(exc).lower()
+    name = exc.__class__.__name__.lower()
+    markers = (
+        "ragasoutputparserexception",
+        "outputparserexception",
+        "output parsing failure",
+        "failed to parse",
+        "the output parser failed to parse",
+    )
+    return any(m in text for m in markers) or any(m in name for m in markers)
+
+
+def _is_headline_property_missing_error(exc: Exception) -> bool:
+    """Detect a known Ragas transform failure in HeadlineSplitter."""
+    text = str(exc).lower()
+    return "headlines' property not found" in text or "\"headlines\" property not found" in text
+
+
+def _build_safe_transforms(llm, embedding_model):
+    """
+    Build a conservative transform pipeline that avoids HeadlineSplitter.
+
+    Reason:
+    Some ragas versions can fail on mixed-length corpora when
+    HeadlinesExtractor only annotates long docs but HeadlineSplitter still runs
+    on nodes without the ``headlines`` property.
+    """
+    from ragas.testset.graph import NodeType  # noqa: PLC0415
+    from ragas.testset.transforms.default import (  # noqa: PLC0415
+        CosineSimilarityBuilder,
+        EmbeddingExtractor,
+        NERExtractor,
+        OverlapScoreBuilder,
+        Parallel,
+        SummaryExtractor,
+        ThemesExtractor,
+    )
+
+    def _filter_doc(node, min_tokens: int = 100):
+        from ragas.testset.transforms.default import num_tokens_from_string  # noqa: PLC0415
+
+        return (
+            node.type == NodeType.DOCUMENT
+            and num_tokens_from_string(node.properties.get("page_content", "")) > min_tokens
+        )
+
+    summary_extractor = SummaryExtractor(
+        llm=llm, filter_nodes=lambda node: _filter_doc(node, 100)
+    )
+    summary_emb_extractor = EmbeddingExtractor(
+        embedding_model=embedding_model,
+        property_name="summary_embedding",
+        embed_property_name="summary",
+        filter_nodes=lambda node: _filter_doc(node, 100),
+    )
+    cosine_sim_builder = CosineSimilarityBuilder(
+        property_name="summary_embedding",
+        new_property_name="summary_similarity",
+        threshold=0.5,
+        filter_nodes=lambda node: _filter_doc(node, 100),
+    )
+    ner_extractor = NERExtractor(llm=llm)
+    ner_overlap_sim = OverlapScoreBuilder(threshold=0.01)
+    theme_extractor = ThemesExtractor(
+        llm=llm, filter_nodes=lambda node: node.type == NodeType.DOCUMENT
+    )
+    return [
+        summary_extractor,
+        # NOTE: CustomNodeFilter is intentionally excluded in the safe profile.
+        # It is fragile with local small models because its scoring prompt
+        # often returns schema-incompatible JSON and causes parser failures.
+        Parallel(summary_emb_extractor, theme_extractor, ner_extractor),
+        Parallel(cosine_sim_builder, ner_overlap_sim),
+    ]
+
+
+def _cap_docs_for_retry(langchain_docs: list, max_docs: int) -> list:
+    """Cap docs count while keeping source diversity with round-robin."""
+    if not langchain_docs:
+        return []
+    max_docs = max(1, int(max_docs))
+    if len(langchain_docs) <= max_docs:
+        return langchain_docs
+
+    grouped: Dict[str, list] = {}
+    source_order: List[str] = []
+    for doc in langchain_docs:
+        metadata = dict(getattr(doc, "metadata", {}) or {})
+        source = str(metadata.get("source") or metadata.get("file_name") or "unknown")
+        if source not in grouped:
+            grouped[source] = []
+            source_order.append(source)
+        grouped[source].append(doc)
+
+    selected: list = []
+    idx_by_source = {src: 0 for src in source_order}
+    while len(selected) < max_docs:
+        progressed = False
+        for src in source_order:
+            idx = idx_by_source[src]
+            if idx < len(grouped[src]) and len(selected) < max_docs:
+                selected.append(grouped[src][idx])
+                idx_by_source[src] += 1
+                progressed = True
+        if not progressed:
+            break
+    return selected if selected else langchain_docs[:max_docs]
+
+
+def _generate_testset_once(
+    generator,
+    docs: list,
+    testset_size: int,
+    critic_llm,
+    emb,
+    run_config,
+    transforms=None,
+):
+    """
+    One call to TestsetGenerator with compatibility fallback for older 0.2.x.
+    """
+    try:
+        return generator.generate_with_langchain_docs(
+            docs,
+            testset_size=testset_size,
+            transforms=transforms,
+            transforms_llm=critic_llm,
+            transforms_embedding_model=emb,
+            run_config=run_config,
+        )
+    except TypeError:
+        # Older 0.2.x builds may not support transforms_llm params
+        logger.info("transforms_llm not supported in this build; using single LLM.")
+        return generator.generate_with_langchain_docs(
+            docs,
+            testset_size=testset_size,
+            transforms=transforms,
+            run_config=run_config,
+        )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -353,27 +657,197 @@ def generate_testset(langchain_docs: list, testset_size: int = 8) -> List[Dict[s
     """
     from ragas.testset import TestsetGenerator  # noqa: PLC0415
 
-    generator_llm = _ragas_llm(temperature=0.4)
-    critic_llm = _ragas_llm(temperature=0.0)
+    # Avoid "documents too short" failures in Ragas transforms
+    prepared_docs = _prepare_langchain_docs_for_testset(
+        langchain_docs=langchain_docs, min_tokens=120, target_tokens=260
+    )
+    prepared_docs = _limit_docs_for_testset(prepared_docs, testset_size=testset_size)
+    logger.info(
+        "Prepared docs for TestsetGenerator: %d -> %d",
+        len(langchain_docs),
+        len(prepared_docs),
+    )
+
+    # mistral:7b generates diverse questions
+    generator_llm = _ragas_llm(temperature=0.4, model_name=_OLLAMA_GENERATOR_MODEL)
     emb = _ragas_embeddings()
 
     generator = TestsetGenerator(llm=generator_llm, embedding_model=emb)
 
-    # transforms_llm acts as the critic: it processes the knowledge graph
-    # (proposition extraction, filtering) at a lower temperature for quality.
-    try:
-        testset = generator.generate_with_langchain_docs(
-            langchain_docs,
-            testset_size=testset_size,
-            transforms_llm=critic_llm,
-            transforms_embedding_model=emb,
+    # transforms_llm acts as the critic.
+    # Retry plan adapts model, concurrency, and docs count for local stability.
+    critic_plan = []
+    for model_name in (_OLLAMA_CRITIC_MODEL, _OLLAMA_GENERATOR_MODEL):
+        if model_name not in critic_plan:
+            critic_plan.append(model_name)
+
+    workers_plan = []
+    for workers in (_RAGAS_MAX_WORKERS, 1):
+        workers = max(1, workers)
+        if workers not in workers_plan:
+            workers_plan.append(workers)
+
+    attempt_plan: List[Tuple[str, int, list, str, str]] = []
+    for critic_model in critic_plan:
+        for workers in workers_plan:
+            plan = (critic_model, workers, prepared_docs, "base", "default")
+            if plan not in attempt_plan:
+                attempt_plan.append(plan)
+
+    parse_doc_caps = [
+        max(1, testset_size * 2),
+        max(_RAGAS_PARSE_MIN_DOCS, testset_size),
+        _RAGAS_PARSE_MIN_DOCS,
+    ]
+    for cap in parse_doc_caps:
+        reduced_docs = _cap_docs_for_retry(prepared_docs, max_docs=cap)
+        if len(reduced_docs) >= len(prepared_docs):
+            continue
+        for critic_model in (_OLLAMA_GENERATOR_MODEL, _OLLAMA_CRITIC_MODEL):
+            plan = (
+                critic_model,
+                1,
+                reduced_docs,
+                f"parse_fallback_cap_{len(reduced_docs)}",
+                "safe",
+            )
+            if plan not in attempt_plan:
+                attempt_plan.append(plan)
+
+    testset = None
+    last_err: Exception | None = None
+    for attempt_idx, (critic_model, workers, attempt_docs, reason, transform_mode) in enumerate(attempt_plan, start=1):
+        critic_llm = _ragas_llm(temperature=0.0, model_name=critic_model)
+        run_config = _ragas_run_config(max_workers=workers)
+        transforms = (
+            _build_safe_transforms(critic_llm, emb)
+            if transform_mode == "safe"
+            else None
         )
-    except TypeError:
-        # Older 0.2.x builds that don't accept transforms_llm yet
-        logger.info("transforms_llm not supported in this build; using single LLM.")
-        testset = generator.generate_with_langchain_docs(
-            langchain_docs, testset_size=testset_size
+        logger.info(
+            "TestsetGenerator attempt %d/%d reason=%s transform=%s docs=%d critic=%s run_config(timeout=%d, max_retries=%d, max_wait=%d, max_workers=%d)",
+            attempt_idx,
+            len(attempt_plan),
+            reason,
+            transform_mode,
+            len(attempt_docs),
+            critic_model,
+            _RAGAS_TIMEOUT,
+            _RAGAS_MAX_RETRIES,
+            _RAGAS_MAX_WAIT,
+            workers,
         )
+        try:
+            testset = _generate_testset_once(
+                generator=generator,
+                docs=attempt_docs,
+                testset_size=testset_size,
+                critic_llm=critic_llm,
+                emb=emb,
+                run_config=run_config,
+                transforms=transforms,
+            )
+            break
+        except ValueError as err:
+            last_err = err
+            # Some ragas builds still raise this if average chunk length is low.
+            if "too short" in str(err).lower():
+                logger.warning(
+                    "Ragas rejected document length (%s). Retrying with more aggressive merge.",
+                    err,
+                )
+                retry_docs = _prepare_langchain_docs_for_testset(
+                    langchain_docs=langchain_docs, min_tokens=200, target_tokens=500
+                )
+                retry_docs = _limit_docs_for_testset(
+                    retry_docs, testset_size=max(1, testset_size)
+                )
+                testset = _generate_testset_once(
+                    generator=generator,
+                    docs=retry_docs,
+                    testset_size=testset_size,
+                    critic_llm=critic_llm,
+                    emb=emb,
+                    run_config=run_config,
+                    transforms=transforms,
+                )
+                break
+            if _is_ragas_parse_error(err) and attempt_idx < len(attempt_plan):
+                logger.warning(
+                    "Ragas parser failed on attempt %d/%d (ValueError path). "
+                    "Retrying with stricter fallback profile. Error: %s",
+                    attempt_idx,
+                    len(attempt_plan),
+                    err,
+                )
+                time.sleep(1)
+                continue
+            if _is_headline_property_missing_error(err) and attempt_idx < len(attempt_plan):
+                logger.warning(
+                    "Ragas HeadlineSplitter failed on attempt %d/%d. "
+                    "Retrying with safer transform profile. Error: %s",
+                    attempt_idx,
+                    len(attempt_plan),
+                    err,
+                )
+                time.sleep(1)
+                continue
+            logger.warning(
+                "Unexpected ValueError from testset generation: %s",
+                err,
+            )
+            raise
+        except Exception as err:
+            last_err = err
+            if _is_ollama_502_error(err) and attempt_idx < len(attempt_plan):
+                wait_s = 5 * attempt_idx
+                logger.warning(
+                    "Ollama returned 502 during testset generation. "
+                    "Retrying with adjusted critic/concurrency in %d second(s).",
+                    wait_s,
+                )
+                time.sleep(wait_s)
+                continue
+            if _is_ragas_parse_error(err) and attempt_idx < len(attempt_plan):
+                logger.warning(
+                    "Ragas parser failed on attempt %d/%d. "
+                    "Retrying with stricter fallback profile. Error: %s",
+                    attempt_idx,
+                    len(attempt_plan),
+                    err,
+                )
+                time.sleep(1)
+                continue
+            raise
+
+    if testset is None:
+        # Final fallback: minimal transforms load to avoid hard failure.
+        fallback_docs = _cap_docs_for_retry(prepared_docs, max_docs=max(_RAGAS_PARSE_MIN_DOCS, 1))
+        logger.warning(
+            "All planned attempts failed. Running final fallback with docs=%d, critic=%s, max_workers=1.",
+            len(fallback_docs),
+            _OLLAMA_GENERATOR_MODEL,
+        )
+        try:
+            testset = _generate_testset_once(
+                generator=generator,
+                docs=fallback_docs,
+                testset_size=max(1, testset_size),
+                critic_llm=_ragas_llm(temperature=0.0, model_name=_OLLAMA_GENERATOR_MODEL),
+                emb=emb,
+                run_config=_ragas_run_config(max_workers=1),
+                transforms=_build_safe_transforms(
+                    _ragas_llm(temperature=0.0, model_name=_OLLAMA_GENERATOR_MODEL),
+                    emb,
+                ),
+            )
+        except Exception as final_err:  # pragma: no cover - defensive guard
+            if last_err is not None:
+                raise RuntimeError(
+                    "Failed to generate testset after retries and final fallback. "
+                    f"Last error: {last_err}"
+                ) from final_err
+            raise RuntimeError("Failed to generate testset after retries and final fallback.") from final_err
 
     df = testset.to_pandas()
     logger.info("TestsetGenerator produced %d rows; columns: %s", len(df), list(df.columns))
@@ -410,7 +884,7 @@ def _evaluate_with_ragas(samples: List[Dict[str, Any]]) -> pd.DataFrame:
         Faithfulness,
     )
 
-    judge_llm = _ragas_llm(temperature=0.0)
+    judge_llm = _ragas_llm(temperature=0.0, model_name=_OLLAMA_JUDGE_MODEL)
     judge_emb = _ragas_embeddings()
 
     ragas_samples = [
@@ -431,8 +905,33 @@ def _evaluate_with_ragas(samples: List[Dict[str, Any]]) -> pd.DataFrame:
         ContextRecall(llm=judge_llm),
     ]
 
-    logger.info("Running Ragas 0.2.x evaluation on %d samples ...", len(samples))
-    result = evaluate(dataset=dataset, metrics=metrics)
+    logger.info(
+        "Running Ragas 0.2.x evaluation on %d samples with RunConfig(timeout=%d, max_retries=%d, max_wait=%d, max_workers=%d) ...",
+        len(samples),
+        _RAGAS_TIMEOUT,
+        _RAGAS_MAX_RETRIES,
+        _RAGAS_MAX_WAIT,
+        min(_RAGAS_MAX_WORKERS, 2),
+    )
+    try:
+        result = evaluate(
+            dataset=dataset,
+            metrics=metrics,
+            run_config=_ragas_run_config(max_workers=min(_RAGAS_MAX_WORKERS, 2)),
+            raise_exceptions=False,
+        )
+    except Exception as err:
+        if not _is_ollama_502_error(err):
+            raise
+        logger.warning(
+            "Ollama returned 502 during evaluation. Retrying once with single worker."
+        )
+        result = evaluate(
+            dataset=dataset,
+            metrics=metrics,
+            run_config=_ragas_run_config(max_workers=1),
+            raise_exceptions=False,
+        )
     return result.to_pandas()
 
 
@@ -465,25 +964,28 @@ class RagasEvaluator:
     def __init__(
         self,
         docs_dir: str = _DEFAULT_DOCS_DIR,
-        rag_model: str = "openrouter",
+        rag_model: str = "mistral-7b",
         output_path: str = "./ragas_results.csv",
         vector_store_dir: str = "./data/eval/ragas_eval_store",
         collection_name: str = "ragas_eval_collection",
         top_k: int = 3,
         testset_size: int = 8,
+        chunking_strategy: str | None = None,
     ) -> None:
         """
         Parameters
         ----------
-        docs_dir         : Folder with PDF / text evaluation files.
-        rag_model        : ``"openrouter"`` | ``"mistral-7b"`` |
-                           ``"llama2-7b"`` | ``"t5-base"``
-        output_path      : Destination CSV file.
-        vector_store_dir : Isolated ChromaDB directory (separate from the
-                           main application store).
-        collection_name  : ChromaDB collection name for this evaluation run.
-        top_k            : Documents retrieved per question.
-        testset_size     : Number of test questions to auto-generate.
+        docs_dir          : Folder with PDF / text evaluation files.
+        rag_model         : ``"mistral-7b"`` | ``"llama2-7b"`` | ``"t5-base"``
+        output_path       : Destination CSV file.
+        vector_store_dir  : Isolated ChromaDB directory (separate from the
+                            main application store).
+        collection_name   : ChromaDB collection name for this evaluation run.
+        top_k             : Documents retrieved per question.
+        testset_size      : Number of test questions to auto-generate.
+        chunking_strategy : ``"fixed"`` | ``"sentence"`` | ``None``.
+                            ``None`` inherits from ``Config.CHUNKING.strategy``
+                            (which matches the main RAG system).
         """
         self.docs_dir = docs_dir
         self.rag_model_name = rag_model
@@ -492,14 +994,13 @@ class RagasEvaluator:
         self.collection_name = collection_name
         self.top_k = top_k
         self.testset_size = testset_size
+        self.chunking_strategy = chunking_strategy
         self._retriever = None
         self._response_gen = None
 
     # ── RAG system ───────────────────────────────────────────────────────────
 
     def _build_rag_llm(self):
-        if self.rag_model_name == "openrouter":
-            return OpenRouterLLMBackend()
         from src.config import Config  # noqa: PLC0415
         model_config = Config.get_model_config(self.rag_model_name)
         if model_config.backend == "ollama":
@@ -522,6 +1023,44 @@ class RagasEvaluator:
         self._retriever = Retriever(vs_config)
         self._response_gen = ResponseGenerator(self._build_rag_llm(), self._retriever)
         logger.info("RAG system ready.")
+
+    def _apply_chunking(self, llamaindex_docs: list) -> list:
+        """
+        Chunk *llamaindex_docs* using the same strategy as the main RAG system.
+
+        Strategy resolution order
+        -------------------------
+        1. ``self.chunking_strategy`` if explicitly set (``"fixed"`` or ``"sentence"``).
+        2. ``Config.CHUNKING.strategy`` — the project-wide default.
+
+        This ensures the evaluation vector store contains the same granularity
+        of chunks as the production vector store.
+        """
+        from src.config import Config, ChunkingConfig  # noqa: PLC0415
+        from src.ingestion.chunking import ChunkingFactory  # noqa: PLC0415
+
+        base_cfg = Config.CHUNKING
+        if self.chunking_strategy and self.chunking_strategy != base_cfg.strategy:
+            # Build an override config that shares chunk_size / overlap from base
+            chunking_cfg = ChunkingConfig(
+                strategy=self.chunking_strategy,
+                chunk_size=base_cfg.chunk_size,
+                chunk_overlap=base_cfg.chunk_overlap,
+            )
+        else:
+            chunking_cfg = base_cfg
+
+        strategy = ChunkingFactory.create_strategy(chunking_cfg)
+        logger.info(
+            "Applying %s chunking (chunk_size=%d, overlap=%d) to %d document(s).",
+            chunking_cfg.strategy,
+            chunking_cfg.chunk_size,
+            chunking_cfg.chunk_overlap,
+            len(llamaindex_docs),
+        )
+        chunked = strategy.chunk_documents(llamaindex_docs)
+        logger.info("Chunking produced %d chunks.", len(chunked))
+        return chunked
 
     def _index_documents(self, llamaindex_docs: list) -> None:
         logger.info("Indexing %d document chunk(s) ...", len(llamaindex_docs))
@@ -550,9 +1089,9 @@ class RagasEvaluator:
                         "reference": reference,
                     }
                 )
-                logger.info("    → %d context(s), answer: %d chars", len(contexts), len(answer))
+                logger.info("    -> %d context(s), answer: %d chars", len(contexts), len(answer))
             except Exception as exc:
-                logger.error("    ✗ Skipped: %s", exc)
+                logger.error("    [SKIP] %s", exc)
         return samples
 
     # ── Output ───────────────────────────────────────────────────────────────
@@ -569,9 +1108,9 @@ class RagasEvaluator:
         print("  RAGAS EVALUATION RESULTS")
         print(sep)
         print(df[show_cols].to_string(index=True, max_colwidth=55))
-        print(f"\n{'─' * 72}")
+        print(f"\n{'-' * 72}")
         print(f"  {'Metric':<32} {'Mean':>8}  {'Min':>8}  {'Max':>8}")
-        print(f"{'─' * 72}")
+        print(f"{'-' * 72}")
         for col in display_cols:
             data = df[col].dropna()
             if len(data):
@@ -594,41 +1133,51 @@ class RagasEvaluator:
         ----------
         skip_indexing : Reuse the vector store from a previous run.
         """
-        # Step 1 – load documents
+        # Step 1 - load documents
         print("\nStep 1/5  Loading documents from folder ...")
         print(f"  Folder : {Path(self.docs_dir).resolve()}")
         llamaindex_docs, langchain_docs = load_documents_from_folder(self.docs_dir)
-        print(f"  ✓ {len(llamaindex_docs)} page/chunk(s) loaded.\n")
+        print(f"  [OK] {len(llamaindex_docs)} page/chunk(s) loaded.\n")
 
-        # Step 2 – generate test dataset
+        # Step 2 - generate test dataset
         print("Step 2/5  Generating test dataset with Ragas TestsetGenerator ...")
-        print(f"  generator LLM    : {_OPENROUTER_MODEL}  (T=0.4)")
-        print(f"  transforms LLM   : {_OPENROUTER_MODEL}  (T=0.0, critic role)")
+        print(f"  generator LLM    : {_OLLAMA_GENERATOR_MODEL}  (T=0.4, via Ollama)")
+        print(f"  transforms LLM   : {_OLLAMA_CRITIC_MODEL}  (T=0.0, critic role via Ollama)")
         print(f"  Target size      : {self.testset_size} questions\n")
 
         test_data = generate_testset(langchain_docs=langchain_docs, testset_size=self.testset_size)
         if not test_data:
             raise RuntimeError(
                 "TestsetGenerator returned no samples. "
-                "Check the API key and that the documents have sufficient text content."
+                "Check that Ollama is running and the documents have sufficient text content."
             )
-        print(f"  ✓ {len(test_data)} question(s) generated.\n")
+        print(f"  [OK] {len(test_data)} question(s) generated.\n")
 
-        # Step 3 – initialise RAG + index
+        # Step 3 - initialise RAG + index
         print("Step 3/5  Initialising RAG pipeline ...")
         self._init_rag_system()
         if not skip_indexing:
-            self._index_documents(llamaindex_docs)
+            from src.config import Config  # noqa: PLC0415
+            effective_strategy = self.chunking_strategy or Config.CHUNKING.strategy
+            print(f"  Chunking strategy : {effective_strategy} "
+                  f"(chunk_size={Config.CHUNKING.chunk_size}, "
+                  f"overlap={Config.CHUNKING.chunk_overlap})")
+            chunked_docs = self._apply_chunking(llamaindex_docs)
+            print(
+                f"  [OK] {len(llamaindex_docs)} page(s) to {len(chunked_docs)} chunk(s) "
+                f"after {effective_strategy} chunking.\n"
+            )
+            self._index_documents(chunked_docs)
         else:
             print("  (Skipping indexing – reusing existing vector store)\n")
 
-        # Step 4 – answer all questions
+        # Step 4 - answer all questions
         print(f"Step 4/5  Running RAG pipeline on {len(test_data)} question(s) ...")
         samples = self._collect_samples(test_data)
         if not samples:
             raise RuntimeError("No RAG samples collected.")
 
-        # Step 5 – evaluate
+        # Step 5 - evaluate
         print(f"\nStep 5/5  Evaluating {len(samples)} sample(s) with Ragas 0.2.x ...\n")
         results_df = _evaluate_with_ragas(samples)
         self._print_results(results_df)

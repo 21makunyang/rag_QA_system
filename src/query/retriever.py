@@ -64,14 +64,14 @@ class Retriever:
                 )
             )
 
-            # Get existing collection or create new one
-            try:
-                self.collection = self.chroma_client.get_collection(self.config.collection_name)
-                logger.info(f"Using existing collection: {self.config.collection_name}")
-            except ValueError:
-                # Collection doesn't exist, create it
-                self.collection = self.chroma_client.create_collection(self.config.collection_name)
-                logger.info(f"Created new collection: {self.config.collection_name}")
+            # Get or create the collection for this retriever instance.
+            # Newer Chroma builds may raise NotFoundError instead of ValueError
+            # when a collection is missing, so using get_or_create_collection
+            # is the most robust option across versions.
+            self.collection = self.chroma_client.get_or_create_collection(
+                self.config.collection_name
+            )
+            logger.info(f"Ready collection: {self.config.collection_name}")
 
             # Initialize LlamaIndex vector store with ChromaDB backend
             self.vector_store = ChromaVectorStore(
