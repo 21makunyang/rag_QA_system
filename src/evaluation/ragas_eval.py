@@ -41,6 +41,7 @@ import logging
 import os
 import re
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
@@ -78,6 +79,7 @@ _RAGAS_PARSE_MIN_DOCS = int(os.environ.get("RAGAS_PARSE_MIN_DOCS", "1"))
 
 # Default folder where the user drops evaluation PDF / text files
 _DEFAULT_DOCS_DIR = "./data/eval/ragas_docs"
+_DEFAULT_RESULTS_DIR = "./data/eval/ragas_eval_results"
 
 # Supported file extensions
 _SUPPORTED_EXTS = {".pdf", ".txt", ".md"}
@@ -965,7 +967,7 @@ class RagasEvaluator:
         self,
         docs_dir: str = _DEFAULT_DOCS_DIR,
         rag_model: str = "mistral-7b",
-        output_path: str = "./ragas_results.csv",
+        output_path: str = _DEFAULT_RESULTS_DIR,
         vector_store_dir: str = "./data/eval/ragas_eval_store",
         collection_name: str = "ragas_eval_collection",
         top_k: int = 3,
@@ -977,7 +979,7 @@ class RagasEvaluator:
         ----------
         docs_dir          : Folder with PDF / text evaluation files.
         rag_model         : ``"mistral-7b"`` | ``"llama2-7b"`` | ``"t5-base"``
-        output_path       : Destination CSV file.
+        output_path       : Destination directory or CSV file path.
         vector_store_dir  : Isolated ChromaDB directory (separate from the
                             main application store).
         collection_name   : ChromaDB collection name for this evaluation run.
@@ -997,6 +999,8 @@ class RagasEvaluator:
         self.chunking_strategy = chunking_strategy
         self._retriever = None
         self._response_gen = None
+        self._run_timestamp = datetime.now()
+        self._source_pdf_files: List[str] = []
 
     # ── RAG system ───────────────────────────────────────────────────────────
 
@@ -1118,10 +1122,33 @@ class RagasEvaluator:
         print(f"{sep}\n")
 
     def _export_csv(self, df: pd.DataFrame) -> None:
-        out = Path(self.output_path)
+        out = self._resolve_output_csv_path()
         out.parent.mkdir(parents=True, exist_ok=True)
-        df.to_csv(out, index=False, encoding="utf-8")
+        export_df = df.copy()
+        export_df["evaluation_timestamp"] = self._run_timestamp.strftime("%Y-%m-%d %H:%M:%S")
+        export_df["source_pdf_files"] = "; ".join(self._source_pdf_files) if self._source_pdf_files else ""
+        export_df["source_pdf_count"] = len(self._source_pdf_files)
+        export_df.to_csv(out, index=False, encoding="utf-8")
         print(f"Results saved to: {out.resolve()}\n")
+
+    def _resolve_output_csv_path(self) -> Path:
+        """
+        Resolve the final CSV output path with a timestamped filename.
+
+        Behaviour
+        ---------
+        - If ``output_path`` is a directory (or has no suffix), save
+          ``ragas_results_YYYYMMDD_HHMMSS.csv`` under that directory.
+        - If ``output_path`` is a CSV file path, append the timestamp before
+          the suffix, e.g. ``ragas_results_YYYYMMDD_HHMMSS.csv``.
+        """
+        timestamp = self._run_timestamp.strftime("%Y%m%d_%H%M%S")
+        raw_path = Path(self.output_path)
+
+        if raw_path.suffix.lower() == ".csv":
+            return raw_path.with_name(f"{raw_path.stem}_{timestamp}.csv")
+
+        return raw_path / f"ragas_results_{timestamp}.csv"
 
     # ── Main entry point ─────────────────────────────────────────────────────
 
@@ -1137,7 +1164,16 @@ class RagasEvaluator:
         print("\nStep 1/5  Loading documents from folder ...")
         print(f"  Folder : {Path(self.docs_dir).resolve()}")
         llamaindex_docs, langchain_docs = load_documents_from_folder(self.docs_dir)
+        self._source_pdf_files = sorted(
+            {
+                str(getattr(doc, "metadata", {}).get("file_name", ""))
+                for doc in llamaindex_docs
+                if str(getattr(doc, "metadata", {}).get("file_name", "")).lower().endswith(".pdf")
+            }
+        )
         print(f"  [OK] {len(llamaindex_docs)} page/chunk(s) loaded.\n")
+        if self._source_pdf_files:
+            print(f"  Source PDFs : {', '.join(self._source_pdf_files)}\n")
 
         # Step 2 - generate test dataset
         print("Step 2/5  Generating test dataset with Ragas TestsetGenerator ...")

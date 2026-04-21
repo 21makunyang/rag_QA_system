@@ -13,14 +13,16 @@ That's it.  The script will:
   • Chunk documents with the same strategy as the main RAG system
   • Index the chunks and answer every question with the RAG pipeline
   • Score the answers with 4 Ragas metrics
-  • Print results and save them to  ragas_results.csv
+  • Print results and save them to  data/eval/ragas_eval_results/
+    with a timestamped filename
 
 Options
 -------
     --docs-dir           PATH    Folder with PDF/text files (default: ./data/eval/ragas_docs/)
     --testset-size       N       Number of questions to generate (default: 8)
     --top-k              K       Documents retrieved per question (default: 3)
-    --output             PATH    CSV output path (default: ./ragas_results.csv)
+    --output             PATH    Output directory or CSV path
+                                 (default: ./data/eval/ragas_eval_results/)
     --rag-model          MODEL   mistral-7b | llama2-7b | t5-base  (default: mistral-7b)
     --chunking-strategy  STR     fixed | sentence  (default: inherits Config.CHUNKING.strategy)
     --skip-indexing              Reuse vector store from a previous run (faster re-runs)
@@ -91,9 +93,13 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output",
         type=str,
-        default="./ragas_results.csv",
+        default="./data/eval/ragas_eval_results",
         metavar="PATH",
-        help="CSV file for evaluation results (default: %(default)s).",
+        help=(
+            "Output directory or CSV path for evaluation results. "
+            "A timestamp will be appended to the filename automatically "
+            "(default: %(default)s)."
+        ),
     )
     parser.add_argument(
         "--rag-model",
