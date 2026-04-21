@@ -37,6 +37,7 @@ class Retriever:
         self.collection: Optional[chromadb.Collection] = None
         self.vector_store: Optional[ChromaVectorStore] = None
         self.index: Optional[VectorStoreIndex] = None
+        self.embed_model = None
 
         self._initialize_vector_store()
 
@@ -91,6 +92,7 @@ class Retriever:
                 model_name=Config.EMBEDDING_MODEL,
                 embed_batch_size=16
             )
+            self.embed_model = embed_model
 
             # Configure LlamaIndex to use the local embedding model
             LlamaIndexSettings.embed_model = embed_model
@@ -179,8 +181,31 @@ class Retriever:
             return retrieved_docs[:top_k]  # Ensure we return only top_k results
 
         except Exception as e:
+            # Compatibility fallback:
+            # some Chroma/adapter combinations may pass where={} and trigger
+            # "Expected where to have exactly one operator". In that case,
+            # query Chroma directly with the computed query embedding.
+            if self._is_empty_where_error(e):
+                logger.warning(
+                    "Retrieve failed due to empty where-clause compatibility issue; "
+                    "falling back to direct vector search."
+                )
+                if self.embed_model is None:
+                    logger.error("Embedding model is not initialized for fallback retrieval.")
+                    raise
+                query_vector = self.embed_model.get_query_embedding(query)
+                return self.search_by_vector(query_vector=query_vector, top_k=top_k)
             logger.error(f"Error retrieving documents: {e}")
             raise
+
+    @staticmethod
+    def _is_empty_where_error(error: Exception) -> bool:
+        """Detect Chroma validation error caused by an empty where dict."""
+        msg = str(error).lower()
+        return (
+            "expected where to have exactly one operator" in msg
+            and "got {}" in msg
+        )
 
     def search_by_vector(self, query_vector: List[float], top_k: int = 5) -> List[Dict[str, Any]]:
         """
