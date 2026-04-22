@@ -140,6 +140,28 @@ def _parse_args() -> argparse.Namespace:
             "(default: %(default)s)."
         ),
     )
+    parser.add_argument(
+        "--export-testset",
+        type=str,
+        default=None,
+        metavar="PATH",
+        help=(
+            "Export the generated test set to a CSV file at the specified path. "
+            "If this option is provided, the test set will be generated and saved, "
+            "then the evaluation will proceed normally."
+        ),
+    )
+    parser.add_argument(
+        "--import-testset",
+        type=str,
+        default=None,
+        metavar="PATH",
+        help=(
+            "Import a previously generated test set from a CSV file. "
+            "If this option is provided, test set generation will be skipped "
+            "and the imported questions will be used for evaluation."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -167,6 +189,8 @@ def main() -> None:
         _RAGAS_MAX_TESTSET_DOCS,
         _RAGAS_MAX_WORKERS,
         _RAGAS_PARSE_MIN_DOCS,
+        import_testset_from_csv,
+        export_testset_to_csv,
     )
     from src.config import Config  # noqa: PLC0415
 
@@ -207,6 +231,18 @@ def main() -> None:
         )
         sys.exit(1)
 
+    # Handle test set import if specified
+    imported_test_data = None
+    if args.import_testset:
+        imported_test_data = import_testset_from_csv(args.import_testset)
+        print(f"  Testset import  : {args.import_testset} ({len(imported_test_data)} questions)")
+        print(f"  Testset size     : {len(imported_test_data)} questions (imported)")
+    else:
+        print(f"  Testset size     : {args.testset_size} questions (auto-generated)")
+
+    if args.export_testset:
+        print(f"  Testset export  : {args.export_testset}")
+
     evaluator = RagasEvaluator(
         docs_dir=args.docs_dir,
         rag_model=args.rag_model,
@@ -216,7 +252,18 @@ def main() -> None:
         testset_size=args.testset_size,
         chunking_strategy=args.chunking_strategy,
     )
-    evaluator.run(skip_indexing=args.skip_indexing)
+
+    # Run evaluation with optional imported test data
+    results_df = evaluator.run(skip_indexing=args.skip_indexing, test_data=imported_test_data)
+
+    # Export test set if requested (only if we generated it, not imported)
+    if args.export_testset and not args.import_testset:
+        export_testset_to_csv(
+            test_data=[{"user_input": row.get("user_input", ""), "reference": row.get("reference", "")}
+                      for _, row in results_df.iterrows()],
+            output_path=args.export_testset,
+            document_count=len(evaluator._source_pdf_files) if evaluator._source_pdf_files else 0
+        )
 
 
 if __name__ == "__main__":
