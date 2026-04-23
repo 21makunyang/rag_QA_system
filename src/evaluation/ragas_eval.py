@@ -83,6 +83,12 @@ _DEFAULT_RESULTS_DIR = "./data/eval/ragas_eval_results"
 
 # Supported file extensions
 _SUPPORTED_EXTS = {".pdf", ".txt", ".md"}
+_METRIC_COLUMNS = [
+    "faithfulness",
+    "answer_relevancy",
+    "context_precision",
+    "context_recall",
+]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -244,6 +250,21 @@ def _to_langchain_docs(llamaindex_docs: list) -> list:
         metadata.setdefault("source", metadata.get("file_name", "unknown"))
         result.append(LCDocument(page_content=text, metadata=metadata))
     return result
+
+
+def _extract_source_file_names(
+    llamaindex_docs: list, suffixes: tuple[str, ...] | None = None
+) -> List[str]:
+    """Collect unique source file names from loaded docs."""
+    names = {
+        str(getattr(doc, "metadata", {}).get("file_name", ""))
+        for doc in llamaindex_docs
+        if str(getattr(doc, "metadata", {}).get("file_name", ""))
+    }
+    if suffixes is not None:
+        suffixes_lower = tuple(s.lower() for s in suffixes)
+        names = {name for name in names if name.lower().endswith(suffixes_lower)}
+    return sorted(names)
 
 
 def _estimate_token_count(text: str) -> int:
@@ -1001,6 +1022,7 @@ class RagasEvaluator:
         self._response_gen = None
         self._run_timestamp = datetime.now()
         self._source_pdf_files: List[str] = []
+        self._sample_failures: List[Dict[str, str]] = []
 
     # ── RAG system ───────────────────────────────────────────────────────────
 
@@ -1075,6 +1097,7 @@ class RagasEvaluator:
 
     def _collect_samples(self, test_data: List[Dict[str, str]]) -> List[Dict[str, Any]]:
         samples: List[Dict[str, Any]] = []
+        self._sample_failures = []
         total = len(test_data)
         for idx, item in enumerate(test_data, start=1):
             question, reference = item["user_input"], item["reference"]
@@ -1095,15 +1118,22 @@ class RagasEvaluator:
                 )
                 logger.info("    -> %d context(s), answer: %d chars", len(contexts), len(answer))
             except Exception as exc:
-                logger.error("    [SKIP] %s", exc)
+                error_text = str(exc).strip() or exc.__class__.__name__
+                self._sample_failures.append(
+                    {
+                        "user_input": question,
+                        "reference": reference,
+                        "error": error_text,
+                    }
+                )
+                logger.error("    [SKIP] %s", error_text)
         return samples
 
     # ── Output ───────────────────────────────────────────────────────────────
 
     @staticmethod
     def _print_results(df: pd.DataFrame) -> None:
-        metric_cols = ["faithfulness", "answer_relevancy", "context_precision", "context_recall"]
-        display_cols = [c for c in metric_cols if c in df.columns]
+        display_cols = [c for c in _METRIC_COLUMNS if c in df.columns]
         question_col = next((c for c in ("user_input", "question") if c in df.columns), None)
         show_cols = ([question_col] if question_col else []) + display_cols
 
@@ -1111,7 +1141,10 @@ class RagasEvaluator:
         print(f"\n{sep}")
         print("  RAGAS EVALUATION RESULTS")
         print(sep)
-        print(df[show_cols].to_string(index=True, max_colwidth=55))
+        if show_cols:
+            print(df[show_cols].to_string(index=True, max_colwidth=55))
+        else:
+            print("  No metric columns found in evaluation output.")
         print(f"\n{'-' * 72}")
         print(f"  {'Metric':<32} {'Mean':>8}  {'Min':>8}  {'Max':>8}")
         print(f"{'-' * 72}")
@@ -1164,12 +1197,8 @@ class RagasEvaluator:
         print("\nStep 1/5  Loading documents from folder ...")
         print(f"  Folder : {Path(self.docs_dir).resolve()}")
         llamaindex_docs, langchain_docs = load_documents_from_folder(self.docs_dir)
-        self._source_pdf_files = sorted(
-            {
-                str(getattr(doc, "metadata", {}).get("file_name", ""))
-                for doc in llamaindex_docs
-                if str(getattr(doc, "metadata", {}).get("file_name", "")).lower().endswith(".pdf")
-            }
+        self._source_pdf_files = _extract_source_file_names(
+            llamaindex_docs, suffixes=(".pdf",)
         )
         print(f"  [OK] {len(llamaindex_docs)} page/chunk(s) loaded.\n")
         if self._source_pdf_files:
@@ -1210,8 +1239,24 @@ class RagasEvaluator:
         # Step 4 - answer all questions
         print(f"Step 4/5  Running RAG pipeline on {len(test_data)} question(s) ...")
         samples = self._collect_samples(test_data)
+        if self._sample_failures:
+            print(
+                f"  [WARN] {len(self._sample_failures)} question(s) failed during "
+                "RAG answer generation and were skipped."
+            )
         if not samples:
-            raise RuntimeError("No RAG samples collected.")
+            unique_errors = sorted(
+                {
+                    failure["error"]
+                    for failure in self._sample_failures
+                    if failure.get("error")
+                }
+            )
+            error_summary = "; ".join(unique_errors[:3]) if unique_errors else "unknown error"
+            raise RuntimeError(
+                "No RAG samples collected. All generated questions failed during "
+                f"answer generation. Error summary: {error_summary}"
+            )
 
         # Step 5 - evaluate
         print(f"\nStep 5/5  Evaluating {len(samples)} sample(s) with Ragas 0.2.x ...\n")

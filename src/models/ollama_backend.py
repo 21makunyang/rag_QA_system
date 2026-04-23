@@ -22,7 +22,7 @@ class OllamaBackend:
             base_url=config.api_base,
             temperature=config.temperature,
             max_tokens=config.max_tokens,
-            request_timeout=30.0
+            request_timeout=1500.0
         )
         logger.info(f"Initialized Ollama backend with model: {config.model_name}")
 
