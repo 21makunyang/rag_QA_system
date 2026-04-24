@@ -76,6 +76,12 @@ _RAGAS_MAX_WORKERS = int(os.environ.get("RAGAS_MAX_WORKERS", "1"))
 _RAGAS_DOCS_PER_QUESTION = int(os.environ.get("RAGAS_DOCS_PER_QUESTION", "8"))
 _RAGAS_MAX_TESTSET_DOCS = int(os.environ.get("RAGAS_MAX_TESTSET_DOCS", "24"))
 _RAGAS_PARSE_MIN_DOCS = int(os.environ.get("RAGAS_PARSE_MIN_DOCS", "1"))
+_RAGAS_TESTSET_OVERSAMPLE_FACTOR = int(
+    os.environ.get("RAGAS_TESTSET_OVERSAMPLE_FACTOR", "2")
+)
+_RAGAS_MAX_GENERATED_QUESTIONS = int(
+    os.environ.get("RAGAS_MAX_GENERATED_QUESTIONS", "48")
+)
 
 # Default folder where the user drops evaluation PDF / text files
 _DEFAULT_DOCS_DIR = "./data/eval/ragas_docs"
@@ -407,7 +413,8 @@ def _limit_docs_for_testset(langchain_docs: list, testset_size: int) -> list:
 
     Ragas TestsetGenerator applies multiple LLM transforms to every input doc.
     On local Ollama, sending too many docs at once can cause repeated 502 errors.
-    This function keeps representative docs across sources using round-robin.
+    This function keeps representative docs across sources and spreads picks
+    within each source to reduce near-duplicate prompts.
     """
     if not langchain_docs:
         return []
@@ -427,16 +434,75 @@ def _limit_docs_for_testset(langchain_docs: list, testset_size: int) -> list:
             source_order.append(source)
         grouped[source].append(doc)
 
+    def _even_positions(total: int, take: int) -> List[int]:
+        """Return unique, sorted indices spaced across [0, total)."""
+        if take <= 0 or total <= 0:
+            return []
+        if take >= total:
+            return list(range(total))
+        if take == 1:
+            return [total // 2]
+
+        step = (total - 1) / (take - 1)
+        picked: List[int] = []
+        seen = set()
+        for i in range(take):
+            idx = int(round(i * step))
+            idx = min(max(idx, 0), total - 1)
+            if idx not in seen:
+                picked.append(idx)
+                seen.add(idx)
+
+        # Rounding can occasionally collapse to fewer points.
+        cursor = 0
+        while len(picked) < take and cursor < total:
+            if cursor not in seen:
+                picked.append(cursor)
+                seen.add(cursor)
+            cursor += 1
+        return sorted(picked)
+
+    # First pass: guarantee each source can contribute one spread sample.
     selected: list = []
-    group_indices = {source: 0 for source in source_order}
+    selected_ids = set()
+    picks_per_source = {source: 0 for source in source_order}
+    for source in source_order:
+        if len(selected) >= target_max:
+            break
+        first_pos = _even_positions(len(grouped[source]), 1)
+        if not first_pos:
+            continue
+        doc = grouped[source][first_pos[0]]
+        doc_id = id(doc)
+        if doc_id in selected_ids:
+            continue
+        selected.append(doc)
+        selected_ids.add(doc_id)
+        picks_per_source[source] = 1
+
+    # Second pass: fill remaining quota by increasing per-source samples
+    # while keeping sample positions spread across each source.
     while len(selected) < target_max:
         progressed = False
         for source in source_order:
-            idx = group_indices[source]
-            if idx < len(grouped[source]) and len(selected) < target_max:
-                selected.append(grouped[source][idx])
-                group_indices[source] += 1
+            if len(selected) >= target_max:
+                break
+            docs = grouped[source]
+            current_take = picks_per_source[source]
+            if current_take >= len(docs):
+                continue
+            next_take = current_take + 1
+            positions = _even_positions(len(docs), next_take)
+            for pos in positions:
+                doc = docs[pos]
+                doc_id = id(doc)
+                if doc_id in selected_ids:
+                    continue
+                selected.append(doc)
+                selected_ids.add(doc_id)
+                picks_per_source[source] = next_take
                 progressed = True
+                break
         if not progressed:
             break
 
@@ -652,6 +718,48 @@ def _generate_testset_once(
         )
 
 
+def _normalize_question_for_dedup(question: str) -> str:
+    """Normalize generated question text for near-duplicate filtering."""
+    normalized = re.sub(r"[\W_]+", " ", question.lower(), flags=re.UNICODE)
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+    return normalized
+
+
+def _deduplicate_test_samples(
+    samples: List[Dict[str, str]], target_size: int
+) -> List[Dict[str, str]]:
+    """Drop duplicate questions and keep at most *target_size* unique samples."""
+    unique_samples: List[Dict[str, str]] = []
+    seen_questions = set()
+    duplicate_count = 0
+
+    for sample in samples:
+        question = str(sample.get("user_input", "")).strip()
+        reference = str(sample.get("reference", "")).strip()
+        if not question or not reference:
+            continue
+
+        dedup_key = _normalize_question_for_dedup(question)
+        if not dedup_key or dedup_key in seen_questions:
+            duplicate_count += 1
+            continue
+
+        seen_questions.add(dedup_key)
+        unique_samples.append({"user_input": question, "reference": reference})
+
+    if duplicate_count:
+        logger.info(
+            "Removed %d duplicate generated question(s): %d -> %d",
+            duplicate_count,
+            len(samples),
+            len(unique_samples),
+        )
+
+    if target_size > 0:
+        return unique_samples[:target_size]
+    return unique_samples
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Testset generation  (Ragas 0.2.x API)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -737,6 +845,20 @@ def generate_testset(langchain_docs: list, testset_size: int = 8) -> List[Dict[s
             if plan not in attempt_plan:
                 attempt_plan.append(plan)
 
+    requested_size = max(1, int(testset_size))
+    oversample_factor = max(1, int(_RAGAS_TESTSET_OVERSAMPLE_FACTOR))
+    generated_size = min(
+        requested_size * oversample_factor,
+        max(requested_size, int(_RAGAS_MAX_GENERATED_QUESTIONS)),
+    )
+    logger.info(
+        "Testset generation target=%d, generation_size=%d (oversample_factor=%d, max_generated=%d)",
+        requested_size,
+        generated_size,
+        oversample_factor,
+        _RAGAS_MAX_GENERATED_QUESTIONS,
+    )
+
     testset = None
     last_err: Exception | None = None
     for attempt_idx, (critic_model, workers, attempt_docs, reason, transform_mode) in enumerate(attempt_plan, start=1):
@@ -764,7 +886,7 @@ def generate_testset(langchain_docs: list, testset_size: int = 8) -> List[Dict[s
             testset = _generate_testset_once(
                 generator=generator,
                 docs=attempt_docs,
-                testset_size=testset_size,
+                testset_size=generated_size,
                 critic_llm=critic_llm,
                 emb=emb,
                 run_config=run_config,
@@ -788,7 +910,7 @@ def generate_testset(langchain_docs: list, testset_size: int = 8) -> List[Dict[s
                 testset = _generate_testset_once(
                     generator=generator,
                     docs=retry_docs,
-                    testset_size=testset_size,
+                    testset_size=generated_size,
                     critic_llm=critic_llm,
                     emb=emb,
                     run_config=run_config,
@@ -855,7 +977,7 @@ def generate_testset(langchain_docs: list, testset_size: int = 8) -> List[Dict[s
             testset = _generate_testset_once(
                 generator=generator,
                 docs=fallback_docs,
-                testset_size=max(1, testset_size),
+                testset_size=generated_size,
                 critic_llm=_ragas_llm(temperature=0.0, model_name=_OLLAMA_GENERATOR_MODEL),
                 emb=emb,
                 run_config=_ragas_run_config(max_workers=1),
@@ -883,8 +1005,21 @@ def generate_testset(langchain_docs: list, testset_size: int = 8) -> List[Dict[s
         if pd.notna(question) and pd.notna(ground_truth) and question and ground_truth:
             samples.append({"user_input": str(question), "reference": str(ground_truth)})
 
-    logger.info("%d valid test samples extracted.", len(samples))
-    return samples
+    deduped_samples = _deduplicate_test_samples(samples, target_size=requested_size)
+    if len(deduped_samples) < requested_size:
+        logger.warning(
+            "Unique generated questions are fewer than requested: %d < %d. "
+            "Consider increasing RAGAS_MAX_TESTSET_DOCS / RAGAS_MAX_GENERATED_QUESTIONS.",
+            len(deduped_samples),
+            requested_size,
+        )
+    else:
+        logger.info(
+            "Using %d deduplicated test samples (requested=%d).",
+            len(deduped_samples),
+            requested_size,
+        )
+    return deduped_samples
 
 
 # ─────────────────────────────────────────────────────────────────────────────
