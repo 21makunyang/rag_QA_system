@@ -73,7 +73,7 @@ _RAGAS_TIMEOUT = int(os.environ.get("RAGAS_TIMEOUT", "240"))
 _RAGAS_MAX_RETRIES = int(os.environ.get("RAGAS_MAX_RETRIES", "6"))
 _RAGAS_MAX_WAIT = int(os.environ.get("RAGAS_MAX_WAIT", "120"))
 _RAGAS_MAX_WORKERS = int(os.environ.get("RAGAS_MAX_WORKERS", "1"))
-_RAGAS_DOCS_PER_QUESTION = int(os.environ.get("RAGAS_DOCS_PER_QUESTION", "8"))
+_RAGAS_DOCS_PER_QUESTION = int(os.environ.get("RAGAS_DOCS_PER_QUESTION", "5"))
 _RAGAS_MAX_TESTSET_DOCS = int(os.environ.get("RAGAS_MAX_TESTSET_DOCS", "24"))
 _RAGAS_PARSE_MIN_DOCS = int(os.environ.get("RAGAS_PARSE_MIN_DOCS", "1"))
 _RAGAS_TESTSET_OVERSAMPLE_FACTOR = int(
@@ -95,6 +95,91 @@ _METRIC_COLUMNS = [
     "context_precision",
     "context_recall",
 ]
+
+
+def export_testset_to_csv(test_data: List[Dict[str, Any]], output_path: str, document_count: int = 0) -> None:
+    """
+    Export test set data to CSV format.
+
+    Parameters
+    ----------
+    test_data : List of test samples with user_input, retrieved_contexts, response, and reference
+    output_path : Path to save the CSV file
+    document_count : Number of source documents (for metadata)
+    """
+    import csv
+    from datetime import datetime
+
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    with open(output_path, 'w', newline='', encoding='utf-8') as f:
+        writer = csv.writer(f)
+
+        # Write metadata header
+        writer.writerow(["# Generated at:", datetime.now().isoformat()])
+        writer.writerow(["# Document count:", document_count])
+        writer.writerow(["# Question count:", len(test_data)])
+        writer.writerow([])  # Empty row for readability
+
+        # Write data header
+        writer.writerow(["user_input", "retrieved_contexts", "response", "reference"])
+
+        # Write test data
+        for item in test_data:
+            writer.writerow([
+                item.get("user_input", ""),
+                item.get("retrieved_contexts", ""),
+                item.get("response", ""),
+                item.get("reference", "")
+            ])
+
+    logger.info(f"Test set exported to {output_path} ({len(test_data)} questions)")
+
+
+def import_testset_from_csv(input_path: str) -> List[Dict[str, str]]:
+    """
+    Import test set data from CSV format.
+
+    Parameters
+    ----------
+    input_path : Path to the CSV file to import
+
+    Returns
+    -------
+    List of test samples with user_input and reference
+    """
+    import csv
+
+    input_path = Path(input_path)
+    if not input_path.exists():
+        raise FileNotFoundError(f"Test set file not found: {input_path}")
+
+    test_data = []
+    with open(input_path, 'r', newline='', encoding='utf-8') as f:
+        reader = csv.reader(f)
+
+        # Skip metadata headers (lines starting with #)
+        for row in reader:
+            if not row or (row[0].startswith('#') if row else False):
+                continue
+            # First non-comment row should be header
+            if row[0] == "user_input" and row[1] == "reference":
+                break
+
+        # Read test data
+        for row in reader:
+            if len(row) >= 2 and row[0] and row[1]:
+                test_data.append({
+                    "user_input": row[0],
+                    "reference": row[1]
+                })
+
+    if not test_data:
+        raise ValueError(f"No valid test data found in {input_path}")
+
+    logger.info(f"Test set imported from {input_path} ({len(test_data)} questions)")
+    return test_data
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -420,7 +505,7 @@ def _limit_docs_for_testset(langchain_docs: list, testset_size: int) -> list:
         return []
 
     target_max = max(testset_size * _RAGAS_DOCS_PER_QUESTION, testset_size)
-    target_max = min(target_max, _RAGAS_MAX_TESTSET_DOCS)
+    # target_max = min(target_max, _RAGAS_MAX_TESTSET_DOCS)
     if len(langchain_docs) <= target_max:
         return langchain_docs
 
@@ -1228,6 +1313,13 @@ class RagasEvaluator:
         self._retriever.index_documents(llamaindex_docs)
         logger.info("Indexing complete.")
 
+    def _clear_vector_store(self) -> None:
+        """Clear all documents from the vector store before indexing."""
+        if self._retriever is not None:
+            logger.info("Clearing vector store ...")
+            self._retriever.clear_index()
+            logger.info("Vector store cleared.")
+
     # ── Sample collection ────────────────────────────────────────────────────
 
     def _collect_samples(self, test_data: List[Dict[str, str]]) -> List[Dict[str, Any]]:
@@ -1320,13 +1412,15 @@ class RagasEvaluator:
 
     # ── Main entry point ─────────────────────────────────────────────────────
 
-    def run(self, skip_indexing: bool = False) -> pd.DataFrame:
+    def run(self, skip_indexing: bool = False, test_data: List[Dict[str, str]] | None = None, clear_vector_store: bool = False) -> pd.DataFrame:
         """
         Execute the full evaluation pipeline.
 
         Parameters
         ----------
         skip_indexing : Reuse the vector store from a previous run.
+        test_data : Pre-generated test data (skips test set generation if provided).
+        clear_vector_store : Clear the vector store before indexing.
         """
         # Step 1 - load documents
         print("\nStep 1/5  Loading documents from folder ...")
@@ -1339,23 +1433,29 @@ class RagasEvaluator:
         if self._source_pdf_files:
             print(f"  Source PDFs : {', '.join(self._source_pdf_files)}\n")
 
-        # Step 2 - generate test dataset
-        print("Step 2/5  Generating test dataset with Ragas TestsetGenerator ...")
-        print(f"  generator LLM    : {_OLLAMA_GENERATOR_MODEL}  (T=0.4, via Ollama)")
-        print(f"  transforms LLM   : {_OLLAMA_CRITIC_MODEL}  (T=0.0, critic role via Ollama)")
-        print(f"  Target size      : {self.testset_size} questions\n")
+        # Step 2 - generate or use provided test dataset
+        if test_data is None:
+            print("Step 2/5  Generating test dataset with Ragas TestsetGenerator ...")
+            print(f"  generator LLM    : {_OLLAMA_GENERATOR_MODEL}  (T=0.4, via Ollama)")
+            print(f"  transforms LLM   : {_OLLAMA_CRITIC_MODEL}  (T=0.0, critic role via Ollama)")
+            print(f"  Target size      : {self.testset_size} questions\n")
 
-        test_data = generate_testset(langchain_docs=langchain_docs, testset_size=self.testset_size)
-        if not test_data:
-            raise RuntimeError(
-                "TestsetGenerator returned no samples. "
-                "Check that Ollama is running and the documents have sufficient text content."
-            )
-        print(f"  [OK] {len(test_data)} question(s) generated.\n")
+            test_data = generate_testset(langchain_docs=langchain_docs, testset_size=self.testset_size)
+            if not test_data:
+                raise RuntimeError(
+                    "TestsetGenerator returned no samples. "
+                    "Check that Ollama is running and the documents have sufficient text content."
+                )
+            print(f"  [OK] {len(test_data)} question(s) generated.\n")
+        else:
+            print("Step 2/5  Using provided test dataset ...")
+            print(f"  Questions loaded : {len(test_data)}\n")
 
         # Step 3 - initialise RAG + index
         print("Step 3/5  Initialising RAG pipeline ...")
         self._init_rag_system()
+        if clear_vector_store:
+            self._clear_vector_store()
         if not skip_indexing:
             from src.config import Config  # noqa: PLC0415
             effective_strategy = self.chunking_strategy or Config.CHUNKING.strategy

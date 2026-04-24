@@ -133,8 +133,30 @@ def query_pipeline(components: dict, query: str) -> dict:
     """
     logger.info(f"Processing query: {query}")
 
-    # Generate response
-    response = components["response_gen"].generate_response(query)
+    # 判断是否使用层级分块（可选：根据配置策略决定）
+    # 如果 Config.CHUNKING.strategy == "hierarchical" 才启用
+    from src.config import Config
+    use_auto_merging = Config.CHUNKING.strategy == "hierarchical"
+
+    original_retriever = None
+    if use_auto_merging:
+        # 保存原始检索器
+        original_retriever = components["response_gen"].retriever
+        # 创建 auto_merging_retriever（可调整 similarity_top_k 和 merge_threshold）
+        auto_retriever = components["retriever"].get_auto_merging_retriever(
+            similarity_top_k=5,
+            merge_threshold=0.5
+        )
+        # 替换 response_gen 中的检索器
+        components["response_gen"].retriever = auto_retriever
+
+    try:
+        # Generate response
+        response = components["response_gen"].generate_response(query)
+    finally:
+        # 恢复原始检索器（避免影响其他调用）
+        if use_auto_merging and original_retriever:
+            components["response_gen"].retriever = original_retriever
 
     # Calculate metrics
     metrics = components["metrics_calc"].calculate_response_metrics(

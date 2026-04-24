@@ -3,8 +3,8 @@ Configuration management for CS6493 LLM Applications
 """
 
 import os
-from dataclasses import dataclass
-from typing import Dict, Any
+from dataclasses import dataclass, field
+from typing import Dict, Any, List
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -23,8 +23,13 @@ class ModelConfig:
 class ChunkingConfig:
     """Configuration for document chunking"""
     chunk_size: int = 256
-    chunk_overlap: int = 25  # 10% of chunk_size
-    strategy: str = "fixed"  # fixed, sentence, semantic
+    chunk_overlap: int = 25
+    strategy: str = "fixed"
+
+    # Hierarchical chunking params
+    chunk_sizes: List[int] = field(default_factory=lambda: [2048, 512, 128])
+    hierarchical_include_metadata: bool = True
+    hierarchical_include_prev_next_rel: bool = True
 
 @dataclass
 class VectorStoreConfig:
@@ -34,6 +39,14 @@ class VectorStoreConfig:
     persist_dir: str = "./data/eval/vector_store"
     # collection_name: str = "cs6493_collection"
     collection_name: str = "cs6493_eval_collection"
+
+#新增
+# @dataclass
+# class ChunkingConfig:
+#     # ... 保留现有配置
+#     chunk_sizes: List[int] = field(default_factory=lambda: [2048, 512, 128])
+#     hierarchical_include_metadata: bool = True
+#     hierarchical_include_prev_next_rel: bool = True
 
 class Config:
     """Main configuration class"""
@@ -62,11 +75,17 @@ class Config:
         )
     }
 
-    # Chunking configuration
+    # Chunking configuration 新增
     CHUNKING = ChunkingConfig(
         chunk_size=256,
         chunk_overlap=25,
-        strategy="fixed"
+        strategy="hierarchical",        # 改为 hierarchical
+        chunk_sizes=[2048, 512, 128],   # 三层粒度
+        hierarchical_include_metadata=True,
+        hierarchical_include_prev_next_rel=True
+        # chunk_size=256,
+        # chunk_overlap=25,
+        # strategy="fixed"
     )
 
     # Vector store configuration

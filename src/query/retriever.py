@@ -13,6 +13,11 @@ from llama_index.vector_stores.chroma import ChromaVectorStore
 
 from src import Config
 
+#新增
+from llama_index.core.retrievers import AutoMergingRetriever
+from llama_index.core.indices import VectorStoreIndex
+from llama_index.core.storage.docstore import SimpleDocumentStore
+
 logger = logging.getLogger(__name__)
 
 
@@ -305,3 +310,32 @@ class Retriever:
         except Exception as e:
             logger.error(f"Error getting collection stats: {e}")
             return {'error': str(e)}
+
+#新增
+def create_auto_merging_retriever(nodes, docstore, similarity_top_k=12):
+    # 叶子节点（最细粒度）用于向量检索
+    leaf_nodes = [n for n in nodes if not n.child_nodes]
+    vector_index = VectorStoreIndex(leaf_nodes, docstore=docstore)
+    base_retriever = vector_index.as_retriever(similarity_top_k=similarity_top_k)
+    auto_retriever = AutoMergingRetriever(
+        base_retriever,
+        docstore=docstore,
+        similarity_top_k=similarity_top_k,
+        merge_threshold=0.5  # 合并相似度阈值，可调
+    )
+    return auto_retriever
+
+#新增，
+def get_auto_merging_retriever(self, similarity_top_k: int = 12, merge_threshold: float = 0.5):
+    from llama_index.core.retrievers import AutoMergingRetriever
+    from llama_index.core.indices import VectorStoreIndex
+    all_nodes = list(self.index.docstore.docs.values())
+    leaf_nodes = [n for n in all_nodes if not getattr(n, 'child_nodes', [])]
+    leaf_index = VectorStoreIndex(leaf_nodes, storage_context=self.storage_context)
+    base_retriever = leaf_index.as_retriever(similarity_top_k=similarity_top_k)
+    return AutoMergingRetriever(
+        base_retriever,
+        docstore=self.index.docstore,
+        similarity_top_k=similarity_top_k,
+        merge_threshold=merge_threshold
+    )
