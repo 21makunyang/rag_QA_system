@@ -27,7 +27,7 @@ class ChunkingConfig:
     strategy: str = "fixed"
 
     # Hierarchical chunking params
-    chunk_sizes: List[int] = field(default_factory=lambda: [2048, 512, 128])
+    chunk_sizes: List[int] = field(default_factory=lambda: [4096, 1024, 512])
     hierarchical_include_metadata: bool = True
     hierarchical_include_prev_next_rel: bool = True
 

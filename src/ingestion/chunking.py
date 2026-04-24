@@ -162,33 +162,45 @@ class HierarchicalChunking(ChunkingStrategy):
 
     def chunk_documents(self, documents: List[Document]) -> List[Document]:
         logger.info(f"Hierarchical chunking {len(documents)} docs with sizes {self.chunk_sizes}")
-
         chunked_documents = []
         for doc in documents:
             try:
                 nodes: List[BaseNode] = self.parser.get_nodes_from_documents([doc])
                 for i, node in enumerate(nodes):
-                    # 构建元数据，保留层级信息
                     chunk_metadata = doc.metadata.copy()
+
+                    # 安全提取父节点ID
+                    parent_id = None
+                    if hasattr(node, 'parent_node') and node.parent_node is not None:
+                        parent_id = str(node.parent_node.node_id) if hasattr(node.parent_node, 'node_id') else None
+                    elif hasattr(node, 'parent_node_id'):
+                        parent_id = str(node.parent_node_id) if node.parent_node_id else None
+
+                    # 只存储基本类型的元数据
                     chunk_metadata.update({
                         'chunk_index': i,
                         'total_chunks': len(nodes),
                         'chunk_strategy': 'hierarchical',
-                        'chunk_sizes': self.chunk_sizes,
-                        'node_id': node.node_id,
-                        # 关键字段：保留父子关系
-                        'parent_node_id': getattr(node, 'parent_node', None),
-                        'child_node_ids': getattr(node, 'child_nodes', [])
+                        'node_id': str(node.node_id),
+                        'parent_node_id': parent_id,  # 现在是字符串或 None
                     })
+
                     chunk_doc = Document(text=node.get_content(), metadata=chunk_metadata)
                     chunked_documents.append(chunk_doc)
             except Exception as e:
                 logger.error(f"Error in hierarchical chunking: {e}")
                 continue
-
         logger.info(f"Created {len(chunked_documents)} hierarchical chunks")
         return chunked_documents
-
+# chunk_metadata.update({
+#                         'chunk_index': i,
+#                         'total_chunks': len(nodes),
+#                         'chunk_strategy': 'hierarchical',
+#                         # 'chunk_sizes': str(self.chunk_sizes),  # 列表转字符串
+#                         'node_id': node.node_id,
+#                         'parent_node_id': getattr(node, 'parent_node', None),
+#                         # 'child_node_ids': str(getattr(node, 'child_nodes', []))  # 列表转字符串
+#                     })
 # class ChunkingFactory:
 #     """Factory for creating chunking strategies"""
 #
