@@ -86,7 +86,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--top-k",
         type=int,
-        default=3,
+        default=5,
         metavar="K",
         help="Documents retrieved per query (default: %(default)s).",
     )
@@ -129,6 +129,11 @@ def _parse_args() -> argparse.Namespace:
         "--skip-indexing",
         action="store_true",
         help="Reuse the vector store from a previous run (skips document indexing).",
+    )
+    parser.add_argument(
+        "--clear-vector-store",
+        action="store_true",
+        help="Clear the vector store before indexing (removes all existing data).",
     )
     parser.add_argument(
         "--vector-store-dir",
@@ -259,8 +264,12 @@ def main() -> None:
     # Export test set if requested (only if we generated it, not imported)
     if args.export_testset and not args.import_testset:
         export_testset_to_csv(
-            test_data=[{"user_input": row.get("user_input", ""), "reference": row.get("reference", "")}
-                      for _, row in results_df.iterrows()],
+            test_data=[{
+                "user_input": row.get("user_input", ""),
+                "retrieved_contexts": row.get("retrieved_contexts", ""),
+                "response": row.get("response", ""),
+                "reference": row.get("reference", "")
+            } for _, row in results_df.iterrows()],
             output_path=args.export_testset,
             document_count=len(evaluator._source_pdf_files) if evaluator._source_pdf_files else 0
         )

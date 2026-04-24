@@ -73,7 +73,7 @@ _RAGAS_TIMEOUT = int(os.environ.get("RAGAS_TIMEOUT", "240"))
 _RAGAS_MAX_RETRIES = int(os.environ.get("RAGAS_MAX_RETRIES", "6"))
 _RAGAS_MAX_WAIT = int(os.environ.get("RAGAS_MAX_WAIT", "120"))
 _RAGAS_MAX_WORKERS = int(os.environ.get("RAGAS_MAX_WORKERS", "1"))
-_RAGAS_DOCS_PER_QUESTION = int(os.environ.get("RAGAS_DOCS_PER_QUESTION", "8"))
+_RAGAS_DOCS_PER_QUESTION = int(os.environ.get("RAGAS_DOCS_PER_QUESTION", "5"))
 _RAGAS_MAX_TESTSET_DOCS = int(os.environ.get("RAGAS_MAX_TESTSET_DOCS", "24"))
 _RAGAS_PARSE_MIN_DOCS = int(os.environ.get("RAGAS_PARSE_MIN_DOCS", "1"))
 
@@ -85,13 +85,13 @@ _DEFAULT_RESULTS_DIR = "./data/eval/ragas_eval_results"
 _SUPPORTED_EXTS = {".pdf", ".txt", ".md"}
 
 
-def export_testset_to_csv(test_data: List[Dict[str, str]], output_path: str, document_count: int = 0) -> None:
+def export_testset_to_csv(test_data: List[Dict[str, Any]], output_path: str, document_count: int = 0) -> None:
     """
     Export test set data to CSV format.
 
     Parameters
     ----------
-    test_data : List of test samples with user_input and reference
+    test_data : List of test samples with user_input, retrieved_contexts, response, and reference
     output_path : Path to save the CSV file
     document_count : Number of source documents (for metadata)
     """
@@ -111,11 +111,16 @@ def export_testset_to_csv(test_data: List[Dict[str, str]], output_path: str, doc
         writer.writerow([])  # Empty row for readability
 
         # Write data header
-        writer.writerow(["user_input", "reference"])
+        writer.writerow(["user_input", "retrieved_contexts", "response", "reference"])
 
         # Write test data
         for item in test_data:
-            writer.writerow([item["user_input"], item["reference"]])
+            writer.writerow([
+                item.get("user_input", ""),
+                item.get("retrieved_contexts", ""),
+                item.get("response", ""),
+                item.get("reference", "")
+            ])
 
     logger.info(f"Test set exported to {output_path} ({len(test_data)} questions)")
 
@@ -472,7 +477,7 @@ def _limit_docs_for_testset(langchain_docs: list, testset_size: int) -> list:
         return []
 
     target_max = max(testset_size * _RAGAS_DOCS_PER_QUESTION, testset_size)
-    target_max = min(target_max, _RAGAS_MAX_TESTSET_DOCS)
+    # target_max = min(target_max, _RAGAS_MAX_TESTSET_DOCS)
     if len(langchain_docs) <= target_max:
         return langchain_docs
 
@@ -1151,6 +1156,13 @@ class RagasEvaluator:
         self._retriever.index_documents(llamaindex_docs)
         logger.info("Indexing complete.")
 
+    def _clear_vector_store(self) -> None:
+        """Clear all documents from the vector store before indexing."""
+        if self._retriever is not None:
+            logger.info("Clearing vector store ...")
+            self._retriever.clear_index()
+            logger.info("Vector store cleared.")
+
     # ── Sample collection ────────────────────────────────────────────────────
 
     def _collect_samples(self, test_data: List[Dict[str, str]]) -> List[Dict[str, Any]]:
@@ -1232,7 +1244,7 @@ class RagasEvaluator:
 
     # ── Main entry point ─────────────────────────────────────────────────────
 
-    def run(self, skip_indexing: bool = False, test_data: List[Dict[str, str]] | None = None) -> pd.DataFrame:
+    def run(self, skip_indexing: bool = False, test_data: List[Dict[str, str]] | None = None, clear_vector_store: bool = False) -> pd.DataFrame:
         """
         Execute the full evaluation pipeline.
 
@@ -1240,6 +1252,7 @@ class RagasEvaluator:
         ----------
         skip_indexing : Reuse the vector store from a previous run.
         test_data : Pre-generated test data (skips test set generation if provided).
+        clear_vector_store : Clear the vector store before indexing.
         """
         # Step 1 - load documents
         print("\nStep 1/5  Loading documents from folder ...")
@@ -1277,6 +1290,8 @@ class RagasEvaluator:
         # Step 3 - initialise RAG + index
         print("Step 3/5  Initialising RAG pipeline ...")
         self._init_rag_system()
+        if clear_vector_store:
+            self._clear_vector_store()
         if not skip_indexing:
             from src.config import Config  # noqa: PLC0415
             effective_strategy = self.chunking_strategy or Config.CHUNKING.strategy
