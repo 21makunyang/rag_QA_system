@@ -88,11 +88,11 @@ Response: """
                     context_str=context_str,
                     query_str=query
                 )
-            end_time = time.time()
+            # end_time = time.time()
             # Generate response
             response_text = self.llm_backend.generate(prompt)
 
-            # end_time = time.time()
+            end_time = time.time()
             generation_time = end_time - start_time
 
             # Prepare response dictionary
