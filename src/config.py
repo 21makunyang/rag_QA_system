@@ -79,7 +79,7 @@ class Config:
     CHUNKING = ChunkingConfig(
         chunk_size=256,
         chunk_overlap=25,
-        strategy="hierarchical",        # 改为 hierarchical
+        strategy="fixed",        # fixed, sentence, hierarchical
         chunk_sizes=[2048, 512, 128],   # 三层粒度
         hierarchical_include_metadata=True,
         hierarchical_include_prev_next_rel=True

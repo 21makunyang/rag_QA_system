@@ -116,7 +116,7 @@ def _parse_args() -> argparse.Namespace:
         "--chunking-strategy",
         type=str,
         default=None,
-        choices=["fixed", "sentence"],
+        choices=["fixed", "sentence", "hierarchical"],
         metavar="STR",
         help=(
             "Chunking strategy used when indexing documents into the evaluation "
