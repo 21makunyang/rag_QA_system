@@ -259,7 +259,8 @@ def main() -> None:
     )
 
     # Run evaluation with optional imported test data
-    results_df = evaluator.run(skip_indexing=args.skip_indexing, test_data=imported_test_data)
+    results_df = evaluator.run(skip_indexing=args.skip_indexing, test_data=imported_test_data,
+                               clear_vector_store=args.clear_vector_store)
 
     # Export test set if requested (only if we generated it, not imported)
     if args.export_testset and not args.import_testset:
