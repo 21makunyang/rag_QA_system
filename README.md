@@ -69,16 +69,16 @@ Place PDF or text files in the `data/documents/` directory.
 2. **Run the application**:
 ```bash
 # Process documents and start interactive mode
-python src/main.py
+python -m src.main
 
 # Run with specific model
-python src/main.py --model mistral-7b
+python -m src.main --model mistral-7b
 
 # Run a single query
-python src/main.py --query "What is the main topic?"
+python -m src.main --query "What is the main topic?"
 
 # Process documents only
-python src/main.py --process-only
+python -m src.main --process-only
 ```
 
 ### Configuration
